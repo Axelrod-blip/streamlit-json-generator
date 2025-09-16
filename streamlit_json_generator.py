@@ -136,8 +136,8 @@ if submitted:
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        # кладём файл в папку productOffering
-        zip_file.writestr(f"productOffering/{json_filename}", pretty)
+        # кладём файл в папку productOfferingGroup
+        zip_file.writestr(f"productOfferingGroup/{json_filename}", pretty)
 
     zip_buffer.seek(0)
 
