@@ -126,9 +126,10 @@ if submitted:
 
     final_json = build_final_json(user_name=user_name, user_id=user_id, locale=locale, offerings=offerings)
 
-    st.subheader("Результат JSON (точно по формату системы)")
+    st.subheader("Результат JSON")
     pretty = json.dumps(final_json, ensure_ascii=False, indent=4)
-    st.code(pretty, language="json")
+    with st.expander("Показать / скрыть JSON"):
+        st.code(pretty, language="json")
 
     # ---- Генерация ZIP ----
     json_filename = f"{safe_name(user_id)}.json"   # имя JSON = ID
