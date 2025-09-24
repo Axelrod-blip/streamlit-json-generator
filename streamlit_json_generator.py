@@ -10,7 +10,8 @@ st.set_page_config(page_title="JSON Generator", layout="centered")
 
 # --- Утилиты ---
 def safe_name(n: str) -> str:
-    if not isinstance(n, str): return str(n)
+    if not isinstance(n, str): 
+        return str(n)
     s = re.sub(r"\s+", "_", str(n).strip())
     return re.sub(r"[^0-9A-Za-z_\-\u0400-\u04FF]", "", s)
 
@@ -26,7 +27,7 @@ def build_addon_offering_row(row_id: str, row_name: str, locale: str) -> Dict[st
     }
 
 def build_json(user_name: str, user_id: str, locale: str,
-               offerings: List[Dict[str, Any]], is_addon: bool) -> Dict[str, Any]:
+               offerings: List[Dict[str, Any]], mode: str) -> Dict[str, Any]:
     base = {
         "effective": True,
         "externalId": [],
@@ -37,9 +38,10 @@ def build_json(user_name: str, user_id: str, locale: str,
         "restriction": [],
         "id": str(user_id),
     }
-    if is_addon:
-        base["purpose"] = ["addOn"]  # услуги для тарифных планов
-    else:  # переходы тарифных планов
+    if mode == "addon":
+        base["purpose"] = ["addOn"]
+    elif mode == "replace":
+        base["purpose"] = ["replaceOffer"]
         base["description"] = [{"locale": locale, "value": user_name}]
     return base
 
@@ -58,7 +60,7 @@ page = st.sidebar.radio(
     [
         "Доступность услуг для одного тарифного плана",
         "Доступность услуг для нескольких тарифных планов",
-        "Переходы тарифных планов",
+        "Swap Offer (переходы тарифных планов)",
     ],
 )
 
@@ -74,7 +76,7 @@ if page == "Доступность услуг для одного тарифно
         df = pd.read_excel(file, engine="openpyxl")
         id_col, name_col = df.columns[0], df.columns[1]
         offerings = [build_addon_offering_row(r[id_col], r[name_col], locale) for _, r in df.iterrows() if pd.notna(r[id_col])]
-        final = build_json(name, uid, locale, offerings, is_addon=True)
+        final = build_json(name, uid, locale, offerings, mode="addon")
         st.json(final)
         download_zip(final, uid, name)
 
@@ -91,24 +93,24 @@ elif page == "Доступность услуг для нескольких та
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for (json_name, json_id), group in grouped:
                 offerings = [build_addon_offering_row(r[df.columns[2]], r[df.columns[3]], locale) for _, r in group.iterrows() if pd.notna(r[df.columns[2]])]
-                final = build_json(json_name, json_id, locale, offerings, is_addon=True)
+                final = build_json(json_name, json_id, locale, offerings, mode="addon")
                 pretty = json.dumps(final, ensure_ascii=False, indent=4)
                 zf.writestr(f"productOfferingGroup/{safe_name(json_id)}.json", pretty)
         zip_buffer.seek(0)
         st.download_button("Скачать ZIP", zip_buffer, "services_jsons.zip", "application/zip")
 
 
-# --- Переходы ---
-elif page == "Переходы тарифных планов":
-    st.title("Переходы тарифных планов")
-    name = st.text_input("Название перехода")
-    uid = st.text_input("ID перехода")
+# --- Swap Offer ---
+elif page == "Swap Offer (переходы тарифных планов)":
+    st.title("Swap Offer (переходы тарифных планов)")
+    name = st.text_input("Название swap offer")
+    uid = st.text_input("ID swap offer")
     locale = st.text_input("Language", value="en-US")
     file = st.file_uploader("Excel: колонка ID тарифов", type=["xls", "xlsx"])
     if st.button("Сгенерировать") and file:
         df = pd.read_excel(file, engine="openpyxl")
         id_col = df.columns[0]
         offerings = [build_pog_offering_row(str(r[id_col]).strip()) for _, r in df.iterrows() if pd.notna(r[id_col])]
-        final = build_json(name, uid, locale, offerings, is_addon=False)
+        final = build_json(name, uid, locale, offerings, mode="replace")
         st.json(final)
         download_zip(final, uid, name)
