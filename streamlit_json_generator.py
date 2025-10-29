@@ -27,9 +27,10 @@ class ExcelColumns:
 def safe_name(n: str) -> str:
     """Sanitize string for filename usage"""
     if not isinstance(n, str):
-        return str(n)
-    s = re.sub(r"\s+", "_", str(n).strip())
-    return re.sub(r"[^0-9A-Za-z_\-\u0400-\u04FF]", "", s)
+        n = str(n)
+    s = re.sub(r"\s+", "_", n.strip())
+    s = re.sub(r"[^0-9A-Za-z_\-\u0400-\u04FF]", "", s)
+    return s or "file"
 
 def validate_excel_columns(df: pd.DataFrame, expected_count: int, mode: str) -> Tuple[bool, str]:
     """Validate Excel file structure"""
@@ -111,7 +112,7 @@ def create_zip_buffer(json_obj: Dict[str, Any], file_id: str, folder: str = "pro
     return zip_buffer
 
 # ------------------------
-# MODULE 1: UPDATE SERVICE
+# MODULE 1: UPDATE SERVICE (исправлено приведение типов/проверки)
 # ------------------------
 def update_zip_with_service(zip_file: zipfile.ZipFile, new_service: Dict[str, Any]) -> Tuple[Dict, Dict]:
     """Update all JSON files in ZIP with new service"""
@@ -122,20 +123,21 @@ def update_zip_with_service(zip_file: zipfile.ZipFile, new_service: Dict[str, An
     if not json_files:
         raise ValueError("JSON файлы не найдены в папке productOfferingGroup/")
 
+    # Сохраняем все файлы (не только JSON), чтобы ничего не потерять
     original_structure = {name: zip_file.open(name).read() for name in file_list}
     updated_jsons = {}
 
     for json_filename in json_files:
         try:
-            json_data = json.loads(original_structure[json_filename].decode("utf-8"))
+            raw = original_structure[json_filename]
+            json_data = json.loads(raw.decode("utf-8"))
             
-            if "productOfferingsInGroup" not in json_data:
-                st.warning(f"Пропущен: нет productOfferingsInGroup → {json_filename}")
+            if "productOfferingsInGroup" not in json_data or not isinstance(json_data["productOfferingsInGroup"], list):
+                st.warning(f"Пропущен: нет корректного productOfferingsInGroup → {json_filename}")
                 continue
 
-            existing_ids = {item.get("id") for item in json_data["productOfferingsInGroup"]}
-            
-            if new_service["id"] in existing_ids:
+            existing_ids = {str(item.get("id")) for item in json_data["productOfferingsInGroup"]}
+            if str(new_service.get("id")) in existing_ids:
                 st.info(f"Услуга уже существует в {json_filename}")
                 continue
 
@@ -151,87 +153,154 @@ def update_zip_with_service(zip_file: zipfile.ZipFile, new_service: Dict[str, An
 
     return updated_jsons, original_structure
 
-def expire_and_add_service(zip_file: zipfile.ZipFile, expire_service_id: str, 
-                          new_service: Dict[str, Any]) -> Tuple[Dict, Dict, Dict]:
+# ------------------------
+# MODULE 1.5: EXPIRE + ADD (переписано с исправлениями)
+# ------------------------
+def process_expire_and_add_services(
+    uploaded_zip: bytes,
+    expire_excel: bytes,
+    add_excel: bytes,
+    locale: str = "en-US"
+) -> Tuple[io.BytesIO, Dict[str, Any]]:
     """
-    Expire existing service and add new service to all JSON files.
-    Логика по файлу:
-      1) найти expire_service_id в productOfferingsInGroup:
-         - если найден и expiredForSales == False -> выставить True, ++expired_count
-         - если найден и уже True -> ++already_expired
-         - если не найден -> ++not_found_count
-      2) проверить наличие новой услуги:
-         - если её id нет -> добавить, ++added_count
-         - если уже есть -> ++already_exists
-      3) сохраняем файл, если были изменения
+    Обновляет ZIP архив:
+    1) Экспайрит указанные услуги по Excel (2 колонки)
+    2) Добавляет новые услуги по Excel (3 колонки)
+    Сохраняет любые прочие файлы из исходного ZIP без изменений.
     """
-    file_list = zip_file.namelist()
-    json_files = [f for f in file_list if f.lower().endswith(".json") 
-                  and "productofferinggroup/" in f.lower()]
 
+    # --- Загружаем ZIP и сохраняем ВСЕ файлы ---
+    zbuf = io.BytesIO(uploaded_zip)
+    with zipfile.ZipFile(zbuf, "r") as zf:
+        all_names = zf.namelist()
+        if not all_names:
+            raise ValueError("Пустой ZIP архив")
+        all_bytes = {name: zf.read(name) for name in all_names}
+
+    json_files = [
+        n for n in all_names
+        if n.lower().endswith(".json") and "productofferinggroup/" in n.lower()
+    ]
     if not json_files:
-        raise ValueError("JSON файлы не найдены в папке productOfferingGroup/")
+        raise ValueError("В ZIP не найдено JSON файлов в папке productOfferingGroup/")
 
-    original_structure = {name: zip_file.open(name).read() for name in file_list}
+    # --- Читаем Excel-файлы из bytes через BytesIO ---
+    df_expire = pd.read_excel(io.BytesIO(expire_excel), engine="openpyxl")
+    df_add = pd.read_excel(io.BytesIO(add_excel), engine="openpyxl")
+
+    # --- Нормализуем и фильтруем ---
+    if df_expire.shape[1] < 2:
+        raise ValueError("Excel для экспайра должен содержать 2 колонки: json_id | service_id")
+    if df_add.shape[1] < 3:
+        raise ValueError("Excel для добавления должен содержать 3 колонки: json_id | service_name | service_id")
+
+    df_expire = df_expire.iloc[:, :2]
+    df_expire.columns = ["json_id", "service_id"]
+    df_expire = df_expire.dropna(subset=["json_id", "service_id"]).assign(
+        json_id=lambda d: d["json_id"].astype(str).str.strip(),
+        service_id=lambda d: d["service_id"].astype(str).str.strip()
+    )
+    df_expire = df_expire[(df_expire["json_id"] != "") & (df_expire["service_id"] != "")]
+
+    df_add = df_add.iloc[:, :3]
+    df_add.columns = ["json_id", "service_name", "service_id"]
+    df_add = df_add.dropna(subset=["json_id", "service_name", "service_id"]).assign(
+        json_id=lambda d: d["json_id"].astype(str).str.strip(),
+        service_id=lambda d: d["service_id"].astype(str).str.strip(),
+        service_name=lambda d: d["service_name"].astype(str).str.strip()
+    )
+    # Удаляем явные мусорные значения
+    df_add = df_add[
+        (df_add["json_id"] != "") &
+        (df_add["service_id"] != "") &
+        (df_add["service_id"].str.lower() != "nan")
+    ]
+
+    # --- Группировки ---
+    expire_map: Dict[str, List[str]] = df_expire.groupby("json_id")["service_id"].apply(list).to_dict()
+    add_map: Dict[str, List[Dict[str, str]]] = df_add.groupby("json_id")[["service_name", "service_id"]].apply(
+        lambda x: x.to_dict("records")
+    ).to_dict()
+
     updated_jsons: Dict[str, str] = {}
-    operation_stats = {
-        "expired_count": 0,
-        "added_count": 0,
-        "not_found_count": 0,
+    stats = {
+        "files_processed": 0,
+        "expired": 0,
         "already_expired": 0,
-        "already_exists": 0
+        "added": 0,
+        "skipped_existing": 0
     }
 
-    for json_filename in json_files:
+    # --- Обработка JSON файлов ---
+    for filename in json_files:
+        data = all_bytes[filename]
         try:
-            json_data = json.loads(original_structure[json_filename].decode("utf-8"))
-            
-            if "productOfferingsInGroup" not in json_data:
-                st.warning(f"Пропущен: нет productOfferingsInGroup → {json_filename}")
-                continue
-
-            offerings = json_data["productOfferingsInGroup"]
-            file_modified = False
-
-            # --- Шаг 1: Экспайрим существующую услугу ---
-            service_found = False
-            for item in offerings:
-                if item.get("id") == expire_service_id:
-                    service_found = True
-                    if item.get("expiredForSales") is False:
-                        item["expiredForSales"] = True
-                        operation_stats["expired_count"] += 1
-                        file_modified = True
-                    else:
-                        # уже было True или отсутствует ключ (считаем как уже экспайрено)
-                        operation_stats["already_expired"] += 1
-                    break  # предполагаем единственную запись с таким id
-
-            if not service_found:
-                operation_stats["not_found_count"] += 1
-
-            # --- Шаг 2: Добавляем новую услугу (если её ещё нет) ---
-            new_id = new_service.get("id")
-            existing_ids = {item.get("id") for item in offerings}
-            if new_id not in existing_ids:
-                offerings.append(new_service)
-                operation_stats["added_count"] += 1
-                file_modified = True
-            else:
-                operation_stats["already_exists"] += 1
-
-            # --- Шаг 3: Сохраняем изменение файла ---
-            if file_modified:
-                updated_jsons[json_filename] = json.dumps(json_data, ensure_ascii=False, indent=4)
-            
-        except json.JSONDecodeError as e:
-            st.warning(f"Невалидный JSON ({json_filename}): {e}")
-            continue
+            json_data = json.loads(data.decode("utf-8"))
         except Exception as e:
-            st.error(f"Ошибка обработки {json_filename}: {e}")
+            st.warning(f"Ошибка чтения {filename}: {e}")
             continue
 
-    return updated_jsons, original_structure, operation_stats
+        json_id = str(json_data.get("id", "")).strip()
+        if not json_id:
+            stats["files_processed"] += 1
+            continue
+
+        offerings = json_data.get("productOfferingsInGroup")
+        if not isinstance(offerings, list):
+            offerings = []
+
+        modified = False
+
+        # 1) Экспайр существующих услуг
+        for sid in expire_map.get(json_id, []):
+            sid = str(sid)
+            for item in offerings:
+                if str(item.get("id")) == sid:
+                    if not item.get("expiredForSales", False):
+                        item["expiredForSales"] = True
+                        stats["expired"] += 1
+                        modified = True
+                    else:
+                        stats["already_expired"] += 1
+
+        # 2) Добавление новых услуг
+        existing_ids = {str(o.get("id")) for o in offerings}
+        for rec in add_map.get(json_id, []):
+            nid = str(rec.get("service_id", "")).strip()
+            nname = str(rec.get("service_name", "")).strip()
+            if not nid or nid.lower() == "nan":
+                continue
+            if nid in existing_ids:
+                stats["skipped_existing"] += 1
+                continue
+            offerings.append({
+                "expiredForSales": False,
+                "id": nid,
+                "isBundle": False,
+                "name": [{"locale": locale, "value": nname}]
+            })
+            existing_ids.add(nid)
+            stats["added"] += 1
+            modified = True
+
+        # 3) Сохранение изменений
+        if modified:
+            json_data["productOfferingsInGroup"] = offerings
+            updated_jsons[filename] = json.dumps(json_data, ensure_ascii=False, indent=4)
+
+        stats["files_processed"] += 1
+
+    # --- Сборка нового ZIP: сохраняем ВСЕ файлы, меняем только обновлённые JSON ---
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as znew:
+        for name in all_names:
+            if name in updated_jsons:
+                znew.writestr(name, updated_jsons[name])
+            else:
+                znew.writestr(name, all_bytes[name])
+    out.seek(0)
+
+    return out, stats
 
 # ------------------------
 # UI: NAVIGATION
@@ -327,104 +396,66 @@ if page == "Добавить услугу в существующие тариф
                 st.exception(e)
 
 # =======================================================
-# MODULE 1.5 UI: EXPIRE AND ADD SERVICE
+# MODULE 1.5 UI: EXPIRE AND ADD SERVICE (исправлено)
 # =======================================================
 elif page == "ADD NEW AND EXPIRE OLD AddOns":
-    st.title("Экспайр существующей услуги и добавление новой")
-    
-    with st.form("expire_add_form"):
-        uploaded_zip = st.file_uploader("Загрузите ZIP архив", type=["zip"], key="expire_zip")
-        
-        st.subheader("1️⃣ Услуга для экспайра")
-        expire_service_id = st.text_input("ID услуги для экспайра", 
-                                         placeholder="c1f49a00-1950-4aa2-acdb-0928b18cd145",
-                                         help="У этой услуги будет изменён флаг expiredForSales на true")
-        
-        st.divider()
-        st.subheader("2️⃣ Новая услуга для добавления")
-        
-        new_service_id = st.text_input("ID новой услуги", 
-                                      placeholder="Введите пожалуста id новой услуги",
-                                      help="ID новой услуги, которая будет добавлена")
-        
-        submitted = st.form_submit_button("Generate", type="primary")
+    st.title("Экспайр и добавление AddOns с помощью Excel")
 
-    if submitted:
-        errors = []
-        if not uploaded_zip:
-            errors.append("Загрузите ZIP архив.")
-        if not expire_service_id.strip():
-            errors.append("Введите ID услуги для экспайра.")
-        if not new_service_id.strip():
-            errors.append("Введите ID новой услуги.")
+    st.markdown("""
+    ### 🧩 Инструкция:
+    1. **Загрузите ZIP** с JSON-файлами (структура `productOfferingGroup/...json`)  
+    2. **Загрузите Excel для экспайра** — 2 колонки:
+       - `json_id` → ID POG   
+       - `service_id` → ID услуги, которую нужно заэкспайрить (значение expired: `true`)
+    3. **Загрузите Excel для добавления новых услуг** — 3 колонки:
+       - `POG ID` → POG , куда добавить
+       - `name` → имя новой услуги
+       - `id` → её уникальный ID  
+    4. Нажмите кнопку **Запустить обработку**
+    """)
 
-        if errors:
-            for e in errors:
-                st.error(e)
+    uploaded_zip = st.file_uploader("📦 ZIP архив с JSON файлами", type=["zip"], key="expire_add_zip")
+    excel_expire = st.file_uploader("📘 Excel для экспайра (2 колонки)", type=["xls", "xlsx"])
+    excel_add = st.file_uploader("📗 Excel для добавления новых услуг (3 колонки)", type=["xls", "xlsx"])
+    locale = st.text_input("🌐 Язык (locale)", value="en-US")
+
+    if st.button("🚀 Запустить обработку", type="primary"):
+        if not uploaded_zip or not excel_expire or not excel_add:
+            st.error("Пожалуйста, загрузите все три файла.")
             st.stop()
 
-        try:
-            with st.spinner("Обработка ZIP архива..."):
-                zip_buffer = io.BytesIO(uploaded_zip.read())
-                
-                with zipfile.ZipFile(zip_buffer, "r") as zip_file:
-                    new_service = {
-                        "expiredForSales": False,
-                        "id": new_service_id.strip(),
-                        "isBundle": False
-                    }
-                    updated_jsons, original_structure, stats = expire_and_add_service(
-                        zip_file, 
-                        expire_service_id.strip(), 
-                        new_service
-                    )
+        with st.spinner("Обработка ZIP архива..."):
+            try:
+                new_zip, stats = process_expire_and_add_services(
+                    uploaded_zip.read(),
+                    excel_expire.read(),
+                    excel_add.read(),
+                    locale
+                )
 
-            if not updated_jsons:
-                st.warning("Не найдено JSON для обновления.")
-                st.stop()
+                st.success("✅ ZIP успешно обновлён!")
 
-            st.success(f"Обработано {len(updated_jsons)} JSON файлов")
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Услуг экспайрено", stats["expired_count"])
-                if stats["already_expired"] > 0:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Файлов обработано", stats["files_processed"])
+                col2.metric("Экспайрено услуг", stats["expired"])
+                col3.metric("Добавлено новых", stats["added"])
+                col4.metric("Пропущено (уже существовали)", stats["skipped_existing"])
+
+                if stats.get("already_expired", 0) > 0:
                     st.caption(f"Уже были экспайрены: {stats['already_expired']}")
-            with col2:
-                st.metric("Услуг добавлено", stats["added_count"])
-                if stats["already_exists"] > 0:
-                    st.caption(f"Уже существовали: {stats['already_exists']}")
-            with col3:
-                st.metric("Не найдено для экспайра", stats["not_found_count"])
-            
-            first_file, first_json = next(iter(updated_jsons.items()))
-            with st.expander(f"Пример обновлённого JSON ({first_file})"):
-                st.code(first_json, language="json")
 
-            new_zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(new_zip_buffer, "w", zipfile.ZIP_DEFLATED) as new_zip:
-                for name, data in original_structure.items():
-                    if name in updated_jsons:
-                        data = updated_jsons[name].encode("utf-8")
-                    new_zip.writestr(name, data)
+                st.download_button(
+                    "📥 Скачать обновлённый ZIP",
+                    new_zip,
+                    "updated_addons.zip",
+                    "application/zip",
+                    type="primary"
+                )
 
-            new_zip_buffer.seek(0)
-            new_zip_filename = uploaded_zip.name.replace(".zip", "_expired_updated.zip")
-
-            st.download_button(
-                "📥 Скачать обновлённый ZIP",
-                new_zip_buffer,
-                new_zip_filename,
-                "application/zip",
-                type="primary"
-            )
-
-        except zipfile.BadZipFile:
-            st.error("Загруженный файл не является корректным ZIP архивом")
-        except Exception as e:
-            st.error(f"Ошибка: {e}")
-            with st.expander("Детали ошибки"):
-                st.exception(e)
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+                with st.expander("Подробности ошибки"):
+                    st.exception(e)
 
 # =======================================================
 # MODULE 2 UI: GENERATE NEW JSON FILES
@@ -451,7 +482,7 @@ else:
             name = st.text_input("Название услуги")
             uid = st.text_input("ID услуги")
         with col2:
-            locale = st.text_input("Language", value="en-US")
+            locale_gen = st.text_input("Language", value="en-US")
         
         file = st.file_uploader("Excel файл (2 колонки: ID услуги, Название)", type=["xls", "xlsx"])
         
@@ -473,7 +504,7 @@ else:
                 
                 id_col, name_col = df_cleaned.columns[0], df_cleaned.columns[1]
                 offerings = [
-                    create_offering(r[id_col], r[name_col], locale) 
+                    create_offering(r[id_col], r[name_col], locale_gen) 
                     for _, r in df_cleaned.iterrows() 
                     if pd.notna(r[id_col])
                 ]
@@ -482,7 +513,11 @@ else:
                     st.warning("Не найдено валидных услуг в Excel файле")
                     st.stop()
                 
-                final = build_json(name, uid, locale, offerings, purpose="addOn")
+                if not name.strip() or not uid.strip():
+                    st.error("Заполните 'Название услуги' и 'ID услуги' для JSON.")
+                    st.stop()
+
+                final = build_json(name, uid, locale_gen, offerings, purpose="addOn")
                 
                 st.success(f"Сгенерировано {len(offerings)} услуг")
                 with st.expander("Просмотр JSON"):
@@ -506,7 +541,7 @@ else:
     elif subpage == "Доступность услуг для нескольких тарифных планов":
         st.subheader("Несколько тарифных планов")
         
-        locale = st.text_input("Language", value="en-US")
+        locale_gen = st.text_input("Language", value="en-US")
         file = st.file_uploader("Excel файл (4 колонки)", type=["xls", "xlsx"])
         
         st.info("Excel должен содержать 4 колонки: Имя JSON | ID JSON | ID услуги | Название услуги")
@@ -533,7 +568,7 @@ else:
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                     for (json_name, json_id), group in grouped:
                         offerings = [
-                            create_offering(r[df_cleaned.columns[2]], r[df_cleaned.columns[3]], locale)
+                            create_offering(r[df_cleaned.columns[2]], r[df_cleaned.columns[3]], locale_gen)
                             for _, r in group.iterrows()
                             if pd.notna(r[df_cleaned.columns[2]])
                         ]
@@ -541,7 +576,7 @@ else:
                         if not offerings:
                             continue
                         
-                        final = build_json(json_name, json_id, locale, offerings, purpose="addOn")
+                        final = build_json(str(json_name), str(json_id), locale_gen, offerings, purpose="addOn")
                         pretty_json = json.dumps(final, ensure_ascii=False, indent=4)
                         zf.writestr(f"productOfferingGroup/{safe_name(json_id)}.json", pretty_json)
                         json_count += 1
@@ -571,7 +606,7 @@ else:
             name = st.text_input("Название swap offer")
             uid = st.text_input("ID swap offer")
         with col2:
-            locale = st.text_input("Language", value="en-US")
+            locale_gen = st.text_input("Language", value="en-US")
         
         file = st.file_uploader("Excel файл (1 колонка: ID тарифов)", type=["xls", "xlsx"])
         
@@ -601,8 +636,12 @@ else:
                 if not offerings:
                     st.warning("Не найдено валидных тарифов в Excel файле")
                     st.stop()
+
+                if not name.strip() or not uid.strip():
+                    st.error("Заполните 'Название swap offer' и 'ID swap offer' для JSON.")
+                    st.stop()
                 
-                final = build_json(name, uid, locale, offerings, purpose="replaceOffer")
+                final = build_json(name, uid, locale_gen, offerings, purpose="replaceOffer")
                 
                 st.success(f"Сгенерировано {len(offerings)} тарифных планов")
                 with st.expander("Просмотр JSON"):
