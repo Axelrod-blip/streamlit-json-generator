@@ -39,7 +39,7 @@ def validate_excel_columns(df: pd.DataFrame, expected_count: int, mode: str) -> 
     if len(df.columns) < expected_count:
         return False, f"Ожидается минимум {expected_count} колонок для режима '{mode}'"
     
-    # Check for data in first rows
+    # Проверяем, что обязательные первые N колонок не полностью пустые
     if df.iloc[:, :expected_count].isnull().all().any():
         return False, "Обнаружены пустые обязательные колонки"
     
@@ -153,7 +153,18 @@ def update_zip_with_service(zip_file: zipfile.ZipFile, new_service: Dict[str, An
 
 def expire_and_add_service(zip_file: zipfile.ZipFile, expire_service_id: str, 
                           new_service: Dict[str, Any]) -> Tuple[Dict, Dict, Dict]:
-    """Expire existing service and add new service to all JSON files"""
+    """
+    Expire existing service and add new service to all JSON files.
+    Логика по файлу:
+      1) найти expire_service_id в productOfferingsInGroup:
+         - если найден и expiredForSales == False -> выставить True, ++expired_count
+         - если найден и уже True -> ++already_expired
+         - если не найден -> ++not_found_count
+      2) проверить наличие новой услуги:
+         - если её id нет -> добавить, ++added_count
+         - если уже есть -> ++already_exists
+      3) сохраняем файл, если были изменения
+    """
     file_list = zip_file.namelist()
     json_files = [f for f in file_list if f.lower().endswith(".json") 
                   and "productofferinggroup/" in f.lower()]
@@ -162,7 +173,7 @@ def expire_and_add_service(zip_file: zipfile.ZipFile, expire_service_id: str,
         raise ValueError("JSON файлы не найдены в папке productOfferingGroup/")
 
     original_structure = {name: zip_file.open(name).read() for name in file_list}
-    updated_jsons = {}
+    updated_jsons: Dict[str, str] = {}
     operation_stats = {
         "expired_count": 0,
         "added_count": 0,
@@ -179,35 +190,37 @@ def expire_and_add_service(zip_file: zipfile.ZipFile, expire_service_id: str,
                 st.warning(f"Пропущен: нет productOfferingsInGroup → {json_filename}")
                 continue
 
+            offerings = json_data["productOfferingsInGroup"]
             file_modified = False
+
+            # --- Шаг 1: Экспайрим существующую услугу ---
             service_found = False
-            
-            # Шаг 1: Экспайрим существующую услугу
-            for item in json_data["productOfferingsInGroup"]:
+            for item in offerings:
                 if item.get("id") == expire_service_id:
                     service_found = True
-                    if item.get("expiredForSales") == False:
+                    if item.get("expiredForSales") is False:
                         item["expiredForSales"] = True
                         operation_stats["expired_count"] += 1
                         file_modified = True
                     else:
+                        # уже было True или отсутствует ключ (считаем как уже экспайрено)
                         operation_stats["already_expired"] += 1
-                    break
-            
+                    break  # предполагаем единственную запись с таким id
+
             if not service_found:
                 operation_stats["not_found_count"] += 1
-            
-            # Шаг 2: Добавляем новую услугу
-            existing_ids = {item.get("id") for item in json_data["productOfferingsInGroup"]}
-            
-            if new_service["id"] not in existing_ids:
-                json_data["productOfferingsInGroup"].append(new_service)
+
+            # --- Шаг 2: Добавляем новую услугу (если её ещё нет) ---
+            new_id = new_service.get("id")
+            existing_ids = {item.get("id") for item in offerings}
+            if new_id not in existing_ids:
+                offerings.append(new_service)
                 operation_stats["added_count"] += 1
                 file_modified = True
             else:
                 operation_stats["already_exists"] += 1
-            
-            # Сохраняем только если были изменения
+
+            # --- Шаг 3: Сохраняем изменение файла ---
             if file_modified:
                 updated_jsons[json_filename] = json.dumps(json_data, ensure_ascii=False, indent=4)
             
