@@ -1,748 +1,716 @@
+"""
+Генератор и обновление JSON (один файл)
+=======================================
+Простой Streamlit-инструмент для работы с Product Offering Group и Category.
+Минимальный UI: одна кнопка "Выполнить", счётчики, скачивание ZIP.
+"""
+
 import io
-import re
 import json
 import zipfile
-from typing import Dict, Any, List, Tuple
+import re
 from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
 
-# ------------------------
-# CONFIG & CONSTANTS
-# ------------------------
-st.set_page_config(page_title="JSON Generator & Updater", layout="centered")
+# =========================
+# КОНСТАНТЫ
+# =========================
+DEFAULT_LOCALE = "en-US"
+POG_DIR = "productOfferingGroup"
+POC_DIR = "productOfferingCategory"
 
-@dataclass
-class ExcelColumns:
-    """Define expected Excel column structures"""
-    SINGLE_PLAN = ["service_id", "service_name"]
-    MULTI_PLAN = ["json_name", "json_id", "service_id", "service_name"]
-    SWAP_OFFER = ["tariff_id"]
-    CATEGORY = ["offer_id", "category_id"]
+SAFE_NAME_PATTERN = re.compile(r"[^0-9A-Za-z_\-\u0400-\u04FF]")
+WHITESPACE_PATTERN = re.compile(r"\s+")
 
-# ------------------------
-# UTILITY FUNCTIONS
-# ------------------------
-def safe_name(n: str) -> str:
-    """Sanitize string for filename usage"""
-    if not isinstance(n, str):
-        n = str(n)
-    s = re.sub(r"\s+", "_", n.strip())
-    s = re.sub(r"[^0-9A-Za-z_\-\u0400-\u04FF]", "", s)
+
+# =========================
+# УТИЛИТЫ
+# =========================
+def _safe_name(name: str) -> str:
+    if not isinstance(name, str):
+        name = str(name)
+    s = WHITESPACE_PATTERN.sub("_", name.strip())
+    s = SAFE_NAME_PATTERN.sub("", s)
     return s or "file"
 
-def validate_excel_columns(df: pd.DataFrame, expected_count: int, mode: str) -> Tuple[bool, str]:
-    """Validate Excel file structure"""
-    if df.empty:
-        return False, "Excel файл пустой"
-    
-    if len(df.columns) < expected_count:
-        return False, f"Ожидается минимум {expected_count} колонок для режима '{mode}'"
-    
-    # Проверяем, что обязательные первые N колонок не полностью пустые
-    if df.iloc[:, :expected_count].isnull().all().any():
-        return False, "Обнаружены пустые обязательные колонки"
-    
-    return True, ""
 
-def remove_duplicates(df: pd.DataFrame, subset_cols: List[int]) -> Tuple[pd.DataFrame, int]:
-    """Remove duplicate rows based on specified columns"""
-    initial_count = len(df)
-    cols_to_check = [df.columns[i] for i in subset_cols if i < len(df.columns)]
-    df_cleaned = df.drop_duplicates(subset=cols_to_check, keep='first')
-    duplicates_count = initial_count - len(df_cleaned)
-    return df_cleaned, duplicates_count
+def _normalize_str(v: Any) -> str:
+    if pd.isna(v):
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
 
-def create_offering(service_id: str, service_name: str = None, locale: str = "en-US", 
-                   expired: bool = False, include_name: bool = True) -> Dict[str, Any]:
-    """Create a service offering object"""
-    offering = {
-        "expiredForSales": expired,
-        "id": str(service_id),
+
+def _normalize_id(v: Any) -> str:
+    s = _normalize_str(v)
+    return s if s else ""
+
+
+def _json_dumps_stable(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=4, sort_keys=True)
+
+
+# =========================
+# ZIP/JSON I/O
+# =========================
+def _read_zip(zip_bytes: bytes) -> Tuple[List[str], Dict[str, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+        names = zf.namelist()
+        content = {n: zf.read(n) for n in names}
+    return names, content
+
+
+def _list_json_in_dir(bytes_map: Dict[str, bytes], dir_name: str) -> List[str]:
+    prefix = f"{dir_name}/"
+    return [n for n in bytes_map if n.startswith(prefix) and n.endswith(".json")]
+
+
+def _load_json(data: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _build_new_zip(original_names: List[str], original_bytes: Dict[str, bytes],
+                   updated_json_map: Dict[str, str]) -> io.BytesIO:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in original_names:
+            if name in updated_json_map:
+                zf.writestr(name, updated_json_map[name].encode("utf-8"))
+            else:
+                zf.writestr(name, original_bytes[name])
+    buf.seek(0)
+    return buf
+
+
+# =========================
+# BUILDERS
+# =========================
+def _make_offering(offer_id: str, name: Optional[str] = None,
+                   locale: str = DEFAULT_LOCALE, expired: bool = False) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "id": offer_id,
         "isBundle": False,
+        "expiredForSales": expired
     }
-    if service_name and include_name:
-        offering["name"] = [{"locale": locale, "value": str(service_name)}]
-    return offering
+    if name:
+        item["name"] = [{"locale": locale, "value": name}]
+    return item
 
-def create_category_json(offer_id: str, category_id: str) -> Dict[str, Any]:
-    """Create category JSON structure"""
+
+def _build_pog_addon(json_name: str, json_id: str, locale: str,
+                     offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
-        "id": str(offer_id),
-        "category": [str(category_id)],
-        "categoryRef": [
-            {
-                "id": str(category_id)
-            }
-        ]
-    }
-
-def build_json(name: str, uid: str, locale: str, offerings: List[Dict[str, Any]], 
-               purpose: str = "addOn") -> Dict[str, Any]:
-    """Build complete JSON structure"""
-    json_obj = {
         "effective": True,
         "externalId": [],
-        "localizedName": [{"locale": locale, "value": name}],
-        "name": safe_name(name),
+        "id": json_id,
+        "localizedName": [{"locale": locale, "value": json_name}],
+        "name": _safe_name(json_name),
         "policy": [],
-        "productOfferingsInGroup": offerings,
-        "restriction": [],
-        "id": str(uid),
-    }
-    
-    if purpose == "addOn":
-        json_obj["purpose"] = ["addOn"]
-    elif purpose == "replaceOffer":
-        json_obj["purpose"] = ["replaceOffer"]
-        json_obj["description"] = [{"locale": locale, "value": name}]
-    
-    return json_obj
-
-def create_zip_buffer(json_obj: Dict[str, Any], file_id: str, folder: str = "productOfferingGroup") -> io.BytesIO:
-    """Create ZIP buffer with JSON file"""
-    zip_buffer = io.BytesIO()
-    pretty_json = json.dumps(json_obj, ensure_ascii=False, indent=4)
-    
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{folder}/{safe_name(file_id)}.json", pretty_json)
-    
-    zip_buffer.seek(0)
-    return zip_buffer
-
-# ------------------------
-# MODULE 1: UPDATE SERVICE (исправлено приведение типов/проверки)
-# ------------------------
-def update_zip_with_service(zip_file: zipfile.ZipFile, new_service: Dict[str, Any]) -> Tuple[Dict, Dict]:
-    """Update all JSON files in ZIP with new service"""
-    file_list = zip_file.namelist()
-    json_files = [f for f in file_list if f.lower().endswith(".json") 
-                  and "productofferinggroup/" in f.lower()]
-
-    if not json_files:
-        raise ValueError("JSON файлы не найдены в папке productOfferingGroup/")
-
-    # Сохраняем все файлы (не только JSON), чтобы ничего не потерять
-    original_structure = {name: zip_file.open(name).read() for name in file_list}
-    updated_jsons = {}
-
-    for json_filename in json_files:
-        try:
-            raw = original_structure[json_filename]
-            json_data = json.loads(raw.decode("utf-8"))
-            
-            if "productOfferingsInGroup" not in json_data or not isinstance(json_data["productOfferingsInGroup"], list):
-                st.warning(f"Пропущен: нет корректного productOfferingsInGroup → {json_filename}")
-                continue
-
-            existing_ids = {str(item.get("id")) for item in json_data["productOfferingsInGroup"]}
-            if str(new_service.get("id")) in existing_ids:
-                st.info(f"Услуга уже существует в {json_filename}")
-                continue
-
-            json_data["productOfferingsInGroup"].append(new_service)
-            updated_jsons[json_filename] = json.dumps(json_data, ensure_ascii=False, indent=4)
-            
-        except json.JSONDecodeError as e:
-            st.warning(f"Невалидный JSON ({json_filename}): {e}")
-            continue
-        except Exception as e:
-            st.error(f"Ошибка обработки {json_filename}: {e}")
-            continue
-
-    return updated_jsons, original_structure
-
-# ------------------------
-# MODULE 1.5: EXPIRE + ADD (переписано с исправлениями)
-# ------------------------
-def process_expire_and_add_services(
-    uploaded_zip: bytes,
-    expire_excel: bytes,
-    add_excel: bytes,
-    locale: str = "en-US"
-) -> Tuple[io.BytesIO, Dict[str, Any]]:
-    """
-    Обновляет ZIP архив:
-    1) Экспайрит указанные услуги по Excel (2 колонки)
-    2) Добавляет новые услуги по Excel (3 колонки)
-    Сохраняет любые прочие файлы из исходного ZIP без изменений.
-    """
-
-    # --- Загружаем ZIP и сохраняем ВСЕ файлы ---
-    zbuf = io.BytesIO(uploaded_zip)
-    with zipfile.ZipFile(zbuf, "r") as zf:
-        all_names = zf.namelist()
-        if not all_names:
-            raise ValueError("Пустой ZIP архив")
-        all_bytes = {name: zf.read(name) for name in all_names}
-
-    json_files = [
-        n for n in all_names
-        if n.lower().endswith(".json") and "productofferinggroup/" in n.lower()
-    ]
-    if not json_files:
-        raise ValueError("В ZIP не найдено JSON файлов в папке productOfferingGroup/")
-
-    # --- Читаем Excel-файлы из bytes через BytesIO ---
-    df_expire = pd.read_excel(io.BytesIO(expire_excel), engine="openpyxl")
-    df_add = pd.read_excel(io.BytesIO(add_excel), engine="openpyxl")
-
-    # --- Нормализуем и фильтруем ---
-    if df_expire.shape[1] < 2:
-        raise ValueError("Excel для экспайра должен содержать 2 колонки: json_id | service_id")
-    if df_add.shape[1] < 3:
-        raise ValueError("Excel для добавления должен содержать 3 колонки: json_id | service_name | service_id")
-
-    df_expire = df_expire.iloc[:, :2]
-    df_expire.columns = ["json_id", "service_id"]
-    df_expire = df_expire.dropna(subset=["json_id", "service_id"]).assign(
-        json_id=lambda d: d["json_id"].astype(str).str.strip(),
-        service_id=lambda d: d["service_id"].astype(str).str.strip()
-    )
-    df_expire = df_expire[(df_expire["json_id"] != "") & (df_expire["service_id"] != "")]
-
-    df_add = df_add.iloc[:, :3]
-    df_add.columns = ["json_id", "service_name", "service_id"]
-    df_add = df_add.dropna(subset=["json_id", "service_name", "service_id"]).assign(
-        json_id=lambda d: d["json_id"].astype(str).str.strip(),
-        service_id=lambda d: d["service_id"].astype(str).str.strip(),
-        service_name=lambda d: d["service_name"].astype(str).str.strip()
-    )
-    # Удаляем явные мусорные значения
-    df_add = df_add[
-        (df_add["json_id"] != "") &
-        (df_add["service_id"] != "") &
-        (df_add["service_id"].str.lower() != "nan")
-    ]
-
-    # --- Группировки ---
-    expire_map: Dict[str, List[str]] = df_expire.groupby("json_id")["service_id"].apply(list).to_dict()
-    add_map: Dict[str, List[Dict[str, str]]] = df_add.groupby("json_id")[["service_name", "service_id"]].apply(
-        lambda x: x.to_dict("records")
-    ).to_dict()
-
-    updated_jsons: Dict[str, str] = {}
-    stats = {
-        "files_processed": 0,
-        "expired": 0,
-        "already_expired": 0,
-        "added": 0,
-        "skipped_existing": 0
+        "productOfferingsInGroup": sorted(offerings, key=lambda x: x["id"]),
+        "purpose": ["addOn"],
+        "restriction": []
     }
 
-    # --- Обработка JSON файлов ---
-    for filename in json_files:
-        data = all_bytes[filename]
-        try:
-            json_data = json.loads(data.decode("utf-8"))
-        except Exception as e:
-            st.warning(f"Ошибка чтения {filename}: {e}")
-            continue
 
-        json_id = str(json_data.get("id", "")).strip()
-        if not json_id:
-            stats["files_processed"] += 1
-            continue
+def _build_pog_replace(json_name: str, json_id: str, locale: str,
+                       offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "description": [{"locale": locale, "value": json_name}],
+        "effective": True,
+        "externalId": [],
+        "id": json_id,
+        "localizedName": [{"locale": locale, "value": json_name}],
+        "name": _safe_name(json_name),
+        "policy": [],
+        "productOfferingsInGroup": sorted(offerings, key=lambda x: x["id"]),
+        "purpose": ["replaceOffer"],
+        "restriction": []
+    }
 
-        offerings = json_data.get("productOfferingsInGroup")
-        if not isinstance(offerings, list):
-            offerings = []
 
-        modified = False
+def _build_category(offer_id: str, category_ids: List[str]) -> Dict[str, Any]:
+    unique_sorted = sorted({cid for cid in (_normalize_id(c) for c in category_ids) if cid})
+    return {
+        "id": offer_id,
+        "category": unique_sorted,
+        "categoryRef": [{"id": cid} for cid in unique_sorted]
+    }
 
-        # 1) Экспайр существующих услуг
-        for sid in expire_map.get(json_id, []):
-            sid = str(sid)
-            for item in offerings:
-                if str(item.get("id")) == sid:
-                    if not item.get("expiredForSales", False):
-                        item["expiredForSales"] = True
-                        stats["expired"] += 1
-                        modified = True
-                    else:
-                        stats["already_expired"] += 1
 
-        # 2) Добавление новых услуг
-        existing_ids = {str(o.get("id")) for o in offerings}
-        for rec in add_map.get(json_id, []):
-            nid = str(rec.get("service_id", "")).strip()
-            nname = str(rec.get("service_name", "")).strip()
-            if not nid or nid.lower() == "nan":
+# =========================
+# РЕЗУЛЬТАТ ОПЕРАЦИЙ
+# =========================
+@dataclass
+class SimpleResult:
+    ok: bool
+    msg: str
+    zip_data: Optional[io.BytesIO]
+    counts: Dict[str, int]
+
+
+# =========================
+# ОПЕРАЦИИ
+# =========================
+def generate_addon_from_excel(excel_bytes: bytes) -> SimpleResult:
+    """
+    1. Доступность услуги для некоторых тарифных планов.
+    Excel: столбцы ТОЛЬКО с точными именами:
+      - Addons name, Addons ID, Имя услуги, ID услуги
+    Выход: ZIP с productOfferingGroup/<Addons ID>.json
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")
+        expected = ["Addons name", "Addons ID", "Имя услуги", "ID услуги"]
+        df = df[expected].copy()
+        for c in expected:
+            df[c] = df[c].apply(_normalize_str)
+
+        df = df[(df["Addons ID"] != "") & (df["ID услуги"] != "")]
+        if df.empty:
+            return SimpleResult(False, "В Excel нет валидных строк", None, {})
+
+        groups = df.groupby(["Addons name", "Addons ID"])
+        buf = io.BytesIO()
+        created_jsons = 0
+        services_total = 0
+
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for (json_name, json_id), g in groups:
+                # дедуп по ID услуги
+                g = g.drop_duplicates(subset=["ID услуги"])
+                offerings = []
+                for _, r in g.iterrows():
+                    sid = _normalize_id(r["ID услуги"])
+                    sname = _normalize_str(r["Имя услуги"])
+                    if not sid:
+                        continue
+                    offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
+                if not offerings:
+                    continue
+                pog = _build_pog_addon(_normalize_str(json_name), _normalize_id(json_id), DEFAULT_LOCALE, offerings)
+                zf.writestr(f"{POG_DIR}/{_safe_name(json_id)}.json", _json_dumps_stable(pog))
+                created_jsons += 1
+                services_total += len(offerings)
+
+        if created_jsons == 0:
+            return SimpleResult(False, "Не удалось построить ни одного JSON", None, {})
+
+        buf.seek(0)
+        return SimpleResult(True, "Готово", buf, {
+            "created_jsons": created_jsons,
+            "services_total": services_total
+        })
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
+    """
+    2. Добавление услуги в существующие планы.
+    Excel: Addons ID, Имя услуги, ID услуги
+    """
+    try:
+        names, blob = _read_zip(zip_bytes)
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
+
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["Addons ID", "Имя услуги", "ID услуги"]]
+        for c in ["Addons ID", "Имя услуги", "ID услуги"]:
+            df[c] = df[c].apply(_normalize_str)
+        df = df[(df["Addons ID"] != "") & (df["ID услуги"] != "")]
+        service_map = df.groupby("Addons ID")[["Имя услуги", "ID услуги"]].apply(lambda x: x.to_dict("records")).to_dict()
+
+        updated: Dict[str, str] = {}
+        counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+
+        found_ids = set()
+
+        for path in json_files:
+            data = _load_json(blob[path])
+            if not data:
                 continue
-            if nid in existing_ids:
-                stats["skipped_existing"] += 1
+            json_id = _normalize_id(data.get("id", ""))
+            if not json_id or json_id not in service_map:
                 continue
-            offerings.append({
-                "expiredForSales": False,
-                "id": nid,
-                "isBundle": False,
-                "name": [{"locale": locale, "value": nname}]
-            })
-            existing_ids.add(nid)
-            stats["added"] += 1
-            modified = True
 
-        # 3) Сохранение изменений
-        if modified:
-            json_data["productOfferingsInGroup"] = offerings
-            updated_jsons[filename] = json.dumps(json_data, ensure_ascii=False, indent=4)
+            found_ids.add(json_id)
+            if data.get("purpose") != ["addOn"]:
+                counts["invalid_target_type"] += 1
+                continue
 
-        stats["files_processed"] += 1
+            offerings = data.get("productOfferingsInGroup", [])
+            existing = {_normalize_id(o.get("id", "")) for o in offerings}
 
-    # --- Сборка нового ZIP: сохраняем ВСЕ файлы, меняем только обновлённые JSON ---
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as znew:
-        for name in all_names:
-            if name in updated_jsons:
-                znew.writestr(name, updated_jsons[name])
-            else:
-                znew.writestr(name, all_bytes[name])
-    out.seek(0)
+            modified = False
+            for rec in service_map[json_id]:
+                sid = _normalize_id(rec["ID услуги"])
+                sname = _normalize_str(rec["Имя услуги"])
+                if not sid:
+                    continue
+                if sid in existing:
+                    counts["skipped_existing"] += 1
+                else:
+                    offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
+                    existing.add(sid)
+                    counts["added"] += 1
+                    modified = True
 
-    return out, stats
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+                counts["files_processed"] += 1
 
-# ------------------------
-# UI: NAVIGATION
-# ------------------------
+        for want_id in service_map.keys():
+            if want_id not in found_ids:
+                counts["not_found_json_id"] += 1
+
+        if not updated:
+            return SimpleResult(True, "Нет изменений", None, counts)
+
+        buf = _build_new_zip(names, blob, updated)
+        return SimpleResult(True, "Готово", buf, counts)
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
+    """
+    3. Экспайр услуги.
+    Excel: json_id, service_id
+    """
+    try:
+        names, blob = _read_zip(zip_bytes)
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
+
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id", "service_id"]]
+        for c in ["json_id", "service_id"]:
+            df[c] = df[c].apply(_normalize_str)
+        df = df[(df["json_id"] != "") & (df["service_id"] != "")]
+        expire_map = df.groupby("json_id")["service_id"].apply(list).to_dict()
+
+        updated: Dict[str, str] = {}
+        counts = {"files_processed": 0, "expired": 0, "already_expired": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+
+        for path in json_files:
+            data = _load_json(blob[path])
+            if not data:
+                continue
+            json_id = _normalize_id(data.get("id", ""))
+            if not json_id or json_id not in expire_map:
+                continue
+
+            if data.get("purpose") != ["addOn"]:
+                counts["invalid_target_type"] += 1
+                continue
+
+            offerings = data.get("productOfferingsInGroup", [])
+            modified = False
+
+            for sid in expire_map[json_id]:
+                sid = _normalize_id(sid)
+                found = False
+                for o in offerings:
+                    if _normalize_id(o.get("id", "")) == sid:
+                        found = True
+                        if not o.get("expiredForSales", False):
+                            o["expiredForSales"] = True
+                            counts["expired"] += 1
+                            modified = True
+                        else:
+                            counts["already_expired"] += 1
+                        break
+                if not found:
+                    counts["not_found_json_id"] += 1
+
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+                counts["files_processed"] += 1
+
+        if not updated:
+            return SimpleResult(True, "Нет изменений", None, counts)
+
+        buf = _build_new_zip(names, blob, updated)
+        return SimpleResult(True, "Готово", buf, counts)
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id: str) -> SimpleResult:
+    """
+    1. Добавление перехода для одного тарифного плана.
+    Excel: offer_id (одна колонка)
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["offer_id"]]
+        df["offer_id"] = df["offer_id"].apply(_normalize_str)
+        df = df[df["offer_id"] != ""]
+        if df.empty:
+            return SimpleResult(False, "В Excel нет валидных строк", None, {})
+
+        offers = [_make_offering(_normalize_id(r["offer_id"])) for _, r in df.iterrows() if _normalize_id(r["offer_id"])]
+        pog = _build_pog_replace(_normalize_str(json_name), _normalize_id(json_id), DEFAULT_LOCALE, offers)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{POG_DIR}/{_safe_name(json_id)}.json", _json_dumps_stable(pog))
+        buf.seek(0)
+        return SimpleResult(True, "Готово", buf, {"created_jsons": 1, "offers_total": len(offers)})
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str) -> SimpleResult:
+    """
+    2. Добавление нового тарифа в переходы.
+    Excel: json_id (список переходов)
+    """
+    try:
+        names, blob = _read_zip(zip_bytes)
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
+
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id"]]
+        df["json_id"] = df["json_id"].apply(_normalize_str)
+        target_ids = {x for x in df["json_id"].tolist() if x}
+
+        updated: Dict[str, str] = {}
+        counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+        seen = set()
+
+        for path in json_files:
+            data = _load_json(blob[path])
+            if not data:
+                continue
+            jid = _normalize_id(data.get("id", ""))
+            if not jid or jid not in target_ids:
+                continue
+
+            seen.add(jid)
+            if data.get("purpose") != ["replaceOffer"]:
+                counts["invalid_target_type"] += 1
+                continue
+
+            offerings = data.get("productOfferingsInGroup", [])
+            existing = {_normalize_id(o.get("id", "")) for o in offerings}
+            if _normalize_id(offer_id) in existing:
+                counts["skipped_existing"] += 1
+                continue
+
+            offerings.append(_make_offering(_normalize_id(offer_id)))
+            data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+            updated[path] = _json_dumps_stable(data)
+            counts["added"] += 1
+            counts["files_processed"] += 1
+
+        for want in target_ids:
+            if want not in seen:
+                counts["not_found_json_id"] += 1
+
+        if not updated:
+            return SimpleResult(True, "Нет изменений", None, counts)
+
+        buf = _build_new_zip(names, blob, updated)
+        return SimpleResult(True, "Готово", buf, counts)
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
+    """
+    3. Экспайр тарифного плана в переходах.
+    Excel: json_id, offer_id
+    """
+    try:
+        names, blob = _read_zip(zip_bytes)
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
+
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id", "offer_id"]]
+        for c in ["json_id", "offer_id"]:
+            df[c] = df[c].apply(_normalize_str)
+        df = df[(df["json_id"] != "") & (df["offer_id"] != "")]
+        expire_map = df.groupby("json_id")["offer_id"].apply(list).to_dict()
+
+        updated: Dict[str, str] = {}
+        counts = {"files_processed": 0, "expired": 0, "already_expired": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+
+        for path in json_files:
+            data = _load_json(blob[path])
+            if not data:
+                continue
+            jid = _normalize_id(data.get("id", ""))
+            if not jid or jid not in expire_map:
+                continue
+
+            if data.get("purpose") != ["replaceOffer"]:
+                counts["invalid_target_type"] += 1
+                continue
+
+            offerings = data.get("productOfferingsInGroup", [])
+            modified = False
+
+            for oid in expire_map[jid]:
+                oid = _normalize_id(oid)
+                found = False
+                for o in offerings:
+                    if _normalize_id(o.get("id", "")) == oid:
+                        found = True
+                        if not o.get("expiredForSales", False):
+                            o["expiredForSales"] = True
+                            counts["expired"] += 1
+                            modified = True
+                        else:
+                            counts["already_expired"] += 1
+                        break
+                if not found:
+                    counts["not_found_json_id"] += 1
+
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+                counts["files_processed"] += 1
+
+        if not updated:
+            return SimpleResult(True, "Нет изменений", None, counts)
+
+        buf = _build_new_zip(names, blob, updated)
+        return SimpleResult(True, "Готово", buf, counts)
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+def generate_categories_from_excel(excel_bytes: bytes) -> SimpleResult:
+    """
+    Категории (ProductOfferingCategory).
+    Excel: offer_id, category_id (replace-модель)
+    """
+    try:
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["offer_id", "category_id"]]
+        for c in ["offer_id", "category_id"]:
+            df[c] = df[c].apply(_normalize_str)
+        df = df[(df["offer_id"] != "") & (df["category_id"] != "")]
+        if df.empty:
+            return SimpleResult(False, "В Excel нет валидных строк", None, {})
+
+        groups = df.groupby("offer_id")["category_id"].apply(list).to_dict()
+        buf = io.BytesIO()
+        created = 0
+        added = 0
+
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for offer_id, cats in groups.items():
+                cat_json = _build_category(_normalize_id(offer_id), [_normalize_id(x) for x in cats])
+                zf.writestr(f"{POC_DIR}/{_safe_name(offer_id)}.json", _json_dumps_stable(cat_json))
+                created += 1
+                added += len(cat_json["category"])
+
+        buf.seek(0)
+        return SimpleResult(True, "Готово", buf, {"created_jsons": created, "added": added})
+    except KeyError as e:
+        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+    except Exception as e:
+        return SimpleResult(False, f"Ошибка: {e}", None, {})
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Генератор и обновление JSON", layout="wide", initial_sidebar_state="expanded")
+
+st.title("Генератор и обновление JSON")
+st.caption("Управление услугами (AddOns), переходами тарифных планов и категориями")
+
 st.sidebar.title("Навигация")
-page = st.sidebar.radio(
-    "Выберите действие:",
-    [
-        "Добавить услугу в существующие тарифные планы",
-        "ADD NEW AND EXPIRE OLD AddOns",
-        "Сгенерировать новые JSON",
-    ],
-)
+main_section = st.sidebar.radio("Выберите раздел:", ["Услуги (AddOns)", "Переходы тарифных планов", "Категории"])
 
-# =======================================================
-# MODULE 1 UI: ADD SERVICE TO EXISTING ZIP
-# =======================================================
-if page == "Добавить услугу в существующие тарифные планы":
-    st.title("Добавление новой услуги в AddOn JSON файлы")
-    
-    with st.form("update_form"):
-        uploaded_zip = st.file_uploader("Загрузите ZIP архив", type=["zip"])
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            service_id = st.text_input("ID услуги", 
-                                      placeholder="ee1374db-4a25-4ae7-b78a-aa493a288f9f")
-        with col2:
-            expired_for_sales = st.selectbox("expiredForSales", [False, True], 
-                                            format_func=lambda x: "false" if not x else "true")
-        
-        service_name = st.text_input("Название услуги", 
-                                    placeholder="4G Bonus 5GB BEEPUL")
-        
-        submitted = st.form_submit_button("Добавить услугу", type="primary")
+def _show_counts(counts: Dict[str, int]):
+    if not counts:
+        return
+    items = list(counts.items())
+    for i in range(0, len(items), 4):
+        cols = st.columns(4)
+        for j, (k, v) in enumerate(items[i:i+4]):
+            with cols[j]:
+                st.metric(k, v)
 
-    if submitted:
-        errors = []
-        if not uploaded_zip:
-            errors.append("Загрузите ZIP архив.")
-        if not service_id.strip():
-            errors.append("Введите ID услуги.")
-        if not service_name.strip():
-            errors.append("Введите название услуги.")
-
-        if errors:
-            for e in errors:
-                st.error(e)
-            st.stop()
-
-        try:
-            with st.spinner("Обработка ZIP архива..."):
-                zip_buffer = io.BytesIO(uploaded_zip.read())
-                
-                with zipfile.ZipFile(zip_buffer, "r") as zip_file:
-                    new_service = create_offering(service_id.strip(), service_name.strip(), 
-                                                 expired=expired_for_sales)
-                    updated_jsons, original_structure = update_zip_with_service(zip_file, new_service)
-
-            if not updated_jsons:
-                st.warning("Не найдено JSON для обновления или все уже содержат данную услугу.")
-                st.stop()
-
-            st.success(f"Услуга добавлена в {len(updated_jsons)} JSON файлов")
-
-            first_file, first_json = next(iter(updated_jsons.items()))
-            with st.expander(f"Пример обновлённого JSON ({first_file})"):
-                st.code(first_json, language="json")
-
-            new_zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(new_zip_buffer, "w", zipfile.ZIP_DEFLATED) as new_zip:
-                for name, data in original_structure.items():
-                    if name in updated_jsons:
-                        data = updated_jsons[name].encode("utf-8")
-                    new_zip.writestr(name, data)
-
-            new_zip_buffer.seek(0)
-            new_zip_filename = uploaded_zip.name.replace(".zip", "_updated.zip")
-
-            st.download_button(
-                "Скачать обновлённый ZIP",
-                new_zip_buffer,
-                new_zip_filename,
-                "application/zip",
-                type="primary"
-            )
-
-        except zipfile.BadZipFile:
-            st.error("Загруженный файл не является корректным ZIP архивом")
-        except Exception as e:
-            st.error(f"Ошибка: {e}")
-            with st.expander("Детали ошибки"):
-                st.exception(e)
-
-# =======================================================
-# MODULE 1.5 UI: EXPIRE AND ADD SERVICE (исправлено)
-# =======================================================
-elif page == "ADD NEW AND EXPIRE OLD AddOns":
-    st.title("Экспайр и добавление AddOns с помощью Excel")
-
-    st.markdown("""
-    ### 🧩 Инструкция:
-    1. **Загрузите ZIP** с JSON-файлами (структура `productOfferingGroup/...json`)  
-    2. **Загрузите Excel для экспайра** — 2 колонки:
-       - `json_id` → ID POG   
-       - `service_id` → ID услуги, которую нужно заэкспайрить (значение expired: `true`)
-    3. **Загрузите Excel для добавления новых услуг** — 3 колонки:
-       - `POG ID` → POG , куда добавить
-       - `name` → имя новой услуги
-       - `id` → её уникальный ID  
-    4. Нажмите кнопку **Запустить обработку**
-    """)
-
-    uploaded_zip = st.file_uploader("📦 ZIP архив с JSON файлами", type=["zip"], key="expire_add_zip")
-    excel_expire = st.file_uploader("📘 Excel для экспайра (2 колонки)", type=["xls", "xlsx"])
-    excel_add = st.file_uploader("📗 Excel для добавления новых услуг (3 колонки)", type=["xls", "xlsx"])
-    locale = st.text_input("🌐 Язык (locale)", value="en-US")
-
-    if st.button("🚀 Запустить обработку", type="primary"):
-        if not uploaded_zip or not excel_expire or not excel_add:
-            st.error("Пожалуйста, загрузите все три файла.")
-            st.stop()
-
-        with st.spinner("Обработка ZIP архива..."):
-            try:
-                new_zip, stats = process_expire_and_add_services(
-                    uploaded_zip.read(),
-                    excel_expire.read(),
-                    excel_add.read(),
-                    locale
-                )
-
-                st.success("✅ ZIP успешно обновлён!")
-
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Файлов обработано", stats["files_processed"])
-                col2.metric("Экспайрено услуг", stats["expired"])
-                col3.metric("Добавлено новых", stats["added"])
-                col4.metric("Пропущено (уже существовали)", stats["skipped_existing"])
-
-                if stats.get("already_expired", 0) > 0:
-                    st.caption(f"Уже были экспайрены: {stats['already_expired']}")
-
-                st.download_button(
-                    "📥 Скачать обновлённый ZIP",
-                    new_zip,
-                    "updated_addons.zip",
-                    "application/zip",
-                    type="primary"
-                )
-
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-                with st.expander("Подробности ошибки"):
-                    st.exception(e)
-
-# =======================================================
-# MODULE 2 UI: GENERATE NEW JSON FILES
-# =======================================================
-else:
-    st.title("Генератор JSON ZIP файлов")
-    
-    subpage = st.radio(
-        "Режим генерации:",
+# --------- Раздел 1: Услуги ----------
+if main_section == "Услуги (AddOns)":
+    st.header("Работа с услугами")
+    scenario = st.radio(
+        "Выберите операцию:",
         [
-            "Доступность услуг для одного тарифного плана",
-            "Доступность услуг для нескольких тарифных планов",
-            "Swap Offer (переходы тарифных планов)",
-            "Изменить категории ProductOfferingCategory",
-        ],
+            "1. Доступность услуги для некоторых тарифных планов",
+            "2. Добавление услуги в существующие планы",
+            "3. Экспайр услуги"
+        ]
     )
 
-    # ===== SINGLE PLAN MODE =====
-    if subpage == "Доступность услуг для одного тарифного плана":
-        st.subheader("Один тарифный план")
-        
+    if scenario.startswith("1."):
+        st.subheader("Доступность услуги для некоторых тарифных планов")
+        st.info("Excel должен содержать столбцы: Addons name, Addons ID, Имя услуги, ID услуги")
+        excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+        if st.button("Выполнить"):
+            if not excel_file:
+                st.error("Загрузите Excel")
+            else:
+                with st.spinner("Обработка..."):
+                    res = generate_addon_from_excel(excel_file.read())
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    st.download_button("Скачать ZIP", res.zip_data, "addons.zip", "application/zip")
+
+    elif scenario.startswith("2."):
+        st.subheader("Добавление услуги в существующие планы")
+        st.info("Excel должен содержать столбцы: Addons ID, Имя услуги, ID услуги")
+        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
+        excel_file = st.file_uploader("Загрузите Excel с услугами", type=["xlsx", "xls"])
+        if st.button("Выполнить"):
+            if not zip_file or not excel_file:
+                st.error("Загрузите ZIP и Excel")
+            else:
+                with st.spinner("Обработка..."):
+                    res = add_services_to_existing_pogs(zip_file.read(), excel_file.read())
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "updated_addons.zip", "application/zip")
+
+    else:
+        st.subheader("Экспайр услуги")
+        st.info("Excel должен содержать столбцы: json_id, service_id")
+        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
+        excel_file = st.file_uploader("Загрузите Excel со списком к экспайру", type=["xlsx", "xls"])
+        if st.button("Выполнить"):
+            if not zip_file or not excel_file:
+                st.error("Загрузите ZIP и Excel")
+            else:
+                with st.spinner("Обработка..."):
+                    res = expire_services_in_pogs(zip_file.read(), excel_file.read())
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "expired_addons.zip", "application/zip")
+
+# --------- Раздел 2: Переходы ----------
+elif main_section == "Переходы тарифных планов":
+    st.header("Работа с переходами (replaceOffer)")
+    scenario = st.radio(
+        "Выберите операцию:",
+        [
+            "1. Создать переход для одного тарифного плана",
+            "2. Добавить тариф в переходы",
+            "3. Экспайр тарифа в переходах"
+        ]
+    )
+
+    if scenario.startswith("1."):
+        st.subheader("Создать новый переход")
+        st.info("Excel должен содержать столбец: offer_id")
+        excel_file = st.file_uploader("Загрузите Excel с offer_id", type=["xlsx", "xls"])
         col1, col2 = st.columns(2)
         with col1:
-            name = st.text_input("Название услуги")
-            uid = st.text_input("ID услуги")
-        with col2:
-            locale_gen = st.text_input("Language", value="en-US")
-        
-        file = st.file_uploader("Excel файл (2 колонки: ID услуги, Название)", type=["xls", "xlsx"])
-        
-        st.info("Excel должен содержать 2 колонки: ID услуги | Название услуги")
-        
-        if st.button("Сгенерировать", type="primary") and file:
-            try:
-                with st.spinner("Чтение Excel файла..."):
-                    df = pd.read_excel(file, engine="openpyxl")
-                
-                is_valid, error_msg = validate_excel_columns(df, 2, "single plan")
-                if not is_valid:
-                    st.error(error_msg)
-                    st.stop()
-                
-                df_cleaned, duplicates_count = remove_duplicates(df, [0])
-                if duplicates_count > 0:
-                    st.info(f"Удалено дубликатов: {duplicates_count}")
-                
-                id_col, name_col = df_cleaned.columns[0], df_cleaned.columns[1]
-                offerings = [
-                    create_offering(r[id_col], r[name_col], locale_gen) 
-                    for _, r in df_cleaned.iterrows() 
-                    if pd.notna(r[id_col])
-                ]
-                
-                if not offerings:
-                    st.warning("Не найдено валидных услуг в Excel файле")
-                    st.stop()
-                
-                if not name.strip() or not uid.strip():
-                    st.error("Заполните 'Название услуги' и 'ID услуги' для JSON.")
-                    st.stop()
+            json_name = st.text_input("Название перехода", placeholder="Replace for ...")
+            json_id = st.text_input("ID перехода")
+        if st.button("Выполнить"):
+            if not excel_file or not json_name or not json_id:
+                st.error("Заполните все поля и загрузите Excel")
+            else:
+                with st.spinner("Обработка..."):
+                    res = create_replace_offer_from_excel(excel_file.read(), json_name, json_id)
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    st.download_button("Скачать ZIP", res.zip_data, "replace_offer.zip", "application/zip")
 
-                final = build_json(name, uid, locale_gen, offerings, purpose="addOn")
-                
-                st.success(f"Сгенерировано {len(offerings)} услуг")
-                with st.expander("Просмотр JSON"):
-                    st.json(final)
-                
-                zip_buffer = create_zip_buffer(final, uid)
-                st.download_button(
-                    "Скачать ZIP",
-                    zip_buffer,
-                    f"{safe_name(name)}.zip",
-                    "application/zip",
-                    type="primary"
-                )
-                
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-                with st.expander("Детали ошибки"):
-                    st.exception(e)
+    elif scenario.startswith("2."):
+        st.subheader("Добавить тариф в переходы")
+        st.info("Excel должен содержать столбец: json_id (ID перехода)")
+        zip_file = st.file_uploader("Загрузите ZIP с переходами", type=["zip"])
+        excel_file = st.file_uploader("Загрузите Excel со списком переходов", type=["xlsx", "xls"])
+        offer_id = st.text_input("ID тарифного плана (offer_id)")
+        if st.button("Выполнить"):
+            if not zip_file or not excel_file or not offer_id:
+                st.error("Заполните все поля и загрузите файлы")
+            else:
+                with st.spinner("Обработка..."):
+                    res = add_offer_to_transitions(zip_file.read(), excel_file.read(), offer_id)
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "updated_replace_offers.zip", "application/zip")
 
-    # ===== MULTIPLE PLANS MODE =====
-    elif subpage == "Доступность услуг для нескольких тарифных планов":
-        st.subheader("Несколько тарифных планов")
-        
-        locale_gen = st.text_input("Language", value="en-US")
-        file = st.file_uploader("Excel файл (4 колонки)", type=["xls", "xlsx"])
-        
-        st.info("Excel должен содержать 4 колонки: Имя JSON | ID JSON | ID услуги | Название услуги")
-        
-        if st.button("Сгенерировать ZIP", type="primary") and file:
-            try:
-                with st.spinner("Обработка Excel файла..."):
-                    df = pd.read_excel(file, engine="openpyxl")
-                
-                is_valid, error_msg = validate_excel_columns(df, 4, "multi plan")
-                if not is_valid:
-                    st.error(error_msg)
-                    st.stop()
-                
-                df_cleaned, duplicates_count = remove_duplicates(df, [0, 1, 2, 3])
-                if duplicates_count > 0:
-                    st.info(f"Удалено дубликатов: {duplicates_count}")
-                
-                grouped = df_cleaned.groupby([df_cleaned.columns[0], df_cleaned.columns[1]])
-                
-                zip_buffer = io.BytesIO()
-                json_count = 0
-                
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for (json_name, json_id), group in grouped:
-                        offerings = [
-                            create_offering(r[df_cleaned.columns[2]], r[df_cleaned.columns[3]], locale_gen)
-                            for _, r in group.iterrows()
-                            if pd.notna(r[df_cleaned.columns[2]])
-                        ]
-                        
-                        if not offerings:
-                            continue
-                        
-                        final = build_json(str(json_name), str(json_id), locale_gen, offerings, purpose="addOn")
-                        pretty_json = json.dumps(final, ensure_ascii=False, indent=4)
-                        zf.writestr(f"productOfferingGroup/{safe_name(json_id)}.json", pretty_json)
-                        json_count += 1
-                
-                zip_buffer.seek(0)
-                st.success(f"Сгенерировано {json_count} JSON файлов")
-                
-                st.download_button(
-                    "Скачать ZIP",
-                    zip_buffer,
-                    "services_jsons.zip",
-                    "application/zip",
-                    type="primary"
-                )
-                
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-                with st.expander("Детали ошибки"):
-                    st.exception(e)
+    else:
+        st.subheader("Экспайр тарифа в переходах")
+        st.info("Excel должен содержать столбцы: json_id, offer_id")
+        zip_file = st.file_uploader("Загрузите ZIP с переходами", type=["zip"])
+        excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+        if st.button("Выполнить"):
+            if not zip_file or not excel_file:
+                st.error("Загрузите ZIP и Excel")
+            else:
+                with st.spinner("Обработка..."):
+                    res = expire_offer_in_transitions(zip_file.read(), excel_file.read())
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "expired_replace_offers.zip", "application/zip")
 
-    # ===== SWAP OFFER MODE =====
-    elif subpage == "Swap Offer (переходы тарифных планов)":
-        st.subheader("Переходы тарифных планов")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            name = st.text_input("Название swap offer")
-            uid = st.text_input("ID swap offer")
-        with col2:
-            locale_gen = st.text_input("Language", value="en-US")
-        
-        file = st.file_uploader("Excel файл (1 колонка: ID тарифов)", type=["xls", "xlsx"])
-        
-        st.info("Excel должен содержать 1 колонку: ID тарифных планов")
-        
-        if st.button("Сгенерировать", type="primary") and file:
-            try:
-                with st.spinner("Чтение Excel файла..."):
-                    df = pd.read_excel(file, engine="openpyxl")
-                
-                is_valid, error_msg = validate_excel_columns(df, 1, "swap offer")
-                if not is_valid:
-                    st.error(error_msg)
-                    st.stop()
-                
-                df_cleaned, duplicates_count = remove_duplicates(df, [0])
-                if duplicates_count > 0:
-                    st.info(f"Удалено дубликатов: {duplicates_count}")
-                
-                id_col = df_cleaned.columns[0]
-                offerings = [
-                    create_offering(str(r[id_col]).strip())
-                    for _, r in df_cleaned.iterrows()
-                    if pd.notna(r[id_col])
-                ]
-                
-                if not offerings:
-                    st.warning("Не найдено валидных тарифов в Excel файле")
-                    st.stop()
-
-                if not name.strip() or not uid.strip():
-                    st.error("Заполните 'Название swap offer' и 'ID swap offer' для JSON.")
-                    st.stop()
-                
-                final = build_json(name, uid, locale_gen, offerings, purpose="replaceOffer")
-                
-                st.success(f"Сгенерировано {len(offerings)} тарифных планов")
-                with st.expander("Просмотр JSON"):
-                    st.json(final)
-                
-                zip_buffer = create_zip_buffer(final, uid)
-                st.download_button(
-                    "Скачать ZIP",
-                    zip_buffer,
-                    f"{safe_name(name)}.zip",
-                    "application/zip",
-                    type="primary"
-                )
-                
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-                with st.expander("Детали ошибки"):
-                    st.exception(e)
-
-    # ===== CATEGORY MODE =====
-    elif subpage == "Изменить категории ProductOfferingCategory":
-        st.subheader("Изменить категории ProductOfferingCategory")
-        
-        file = st.file_uploader("Excel файл (2 колонки: Offer_id, Category_id)", type=["xls", "xlsx"])
-        
-        st.info("Excel должен содержать 2 колонки: Offer_id | Category_id")
-        
-        with st.expander("Пример структуры JSON"):
-            st.code('''{
-    "id": "0a9e12ee-4cbf-47aa-a492-82596254721c",
-    "category": [
-        "39d54e58-67e0-4a0d-89ae-80a6b91ffe17"
-    ],
-    "categoryRef": [
-        {
-            "id": "39d54e58-67e0-4a0d-89ae-80a6b91ffe17"
-        }
-    ]
-}''', language="json")
-        
-        if st.button("Сгенерировать ZIP", type="primary") and file:
-            try:
-                with st.spinner("Обработка Excel файла..."):
-                    df = pd.read_excel(file, engine="openpyxl")
-                
-                is_valid, error_msg = validate_excel_columns(df, 2, "category")
-                if not is_valid:
-                    st.error(error_msg)
-                    st.stop()
-                
-                df_cleaned, duplicates_count = remove_duplicates(df, [0, 1])
-                if duplicates_count > 0:
-                    st.info(f"Удалено дубликатов: {duplicates_count}")
-                
-                offer_col, category_col = df_cleaned.columns[0], df_cleaned.columns[1]
-                grouped = df_cleaned.groupby(offer_col)
-                
-                zip_buffer = io.BytesIO()
-                json_count = 0
-                
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for offer_id, group in grouped:
-                        if pd.isna(offer_id):
-                            continue
-                        
-                        categories = [
-                            str(r[category_col]).strip()
-                            for _, r in group.iterrows()
-                            if pd.notna(r[category_col])
-                        ]
-                        
-                        if not categories:
-                            continue
-                        
-                        category_json = {
-                            "id": str(offer_id).strip(),
-                            "category": categories,
-                            "categoryRef": [{"id": cat_id} for cat_id in categories]
-                        }
-                        
-                        pretty_json = json.dumps(category_json, ensure_ascii=False, indent=4)
-                        zf.writestr(f"productOfferingCategory/{safe_name(offer_id)}.json", pretty_json)
-                        json_count += 1
-                
-                zip_buffer.seek(0)
-                st.success(f"Сгенерировано {json_count} JSON файлов категорий")
-                
-                if json_count > 0:
-                    df_preview = df_cleaned.head(3)
-                    with st.expander("Предпросмотр данных"):
-                        st.dataframe(df_preview)
-                
-                st.download_button(
-                    "Скачать ZIP",
-                    zip_buffer,
-                    "product_offering_categories.zip",
-                    "application/zip",
-                    type="primary"
-                )
-                
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-                with st.expander("Детали ошибки"):
-                    st.exception(e)
+# --------- Раздел 3: Категории ----------
+else:
+    st.header("Категории (ProductOfferingCategory)")
+    st.subheader("Сгенерировать категории из Excel")
+    st.info("Excel должен содержать столбцы: offer_id, category_id (несколько строк на один offer_id объединяются)")
+    excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+    if st.button("Выполнить"):
+        if not excel_file:
+            st.error("Загрузите Excel")
+        else:
+            with st.spinner("Обработка..."):
+                res = generate_categories_from_excel(excel_file.read())
+            if not res.ok:
+                st.error(res.msg)
+            else:
+                st.success(res.msg)
+                _show_counts(res.counts)
+                st.download_button("Скачать ZIP", res.zip_data, "categories.zip", "application/zip")
