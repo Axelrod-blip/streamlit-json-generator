@@ -3,6 +3,7 @@
 =======================================
 Простой Streamlit-инструмент для работы с Product Offering Group и Category.
 Минимальный UI: одна кнопка "Выполнить", счётчики, скачивание ZIP.
++ Детализация пропусков (skipped_existing) и выгрузка CSV.
 """
 
 import io
@@ -51,6 +52,32 @@ def _normalize_id(v: Any) -> str:
 
 def _json_dumps_stable(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=4, sort_keys=True)
+
+
+def _read_table(excel_bytes: bytes, expected_cols: List[str]) -> pd.DataFrame:
+    """
+    Универсальный ридер: пробует XLSX/XLS, при ошибке — CSV (UTF-8/auto).
+    Строго проверяет наличие expected_cols.
+    """
+    buf = io.BytesIO(excel_bytes)
+
+    # Пробуем Excel
+    try:
+        df = pd.read_excel(buf, engine="openpyxl")
+    except Exception:
+        # Fallback: CSV с автодетектом
+        buf.seek(0)
+        try:
+            df = pd.read_csv(buf)
+        except Exception:
+            buf.seek(0)
+            df = pd.read_csv(buf, sep=";", engine="python")
+
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Нет требуемого столбца(ов): {', '.join(missing)}")
+
+    return df[expected_cols].copy()
 
 
 # =========================
@@ -152,6 +179,7 @@ class SimpleResult:
     msg: str
     zip_data: Optional[io.BytesIO]
     counts: Dict[str, int]
+    details: Optional[Dict[str, Any]] = None
 
 
 # =========================
@@ -160,14 +188,13 @@ class SimpleResult:
 def generate_addon_from_excel(excel_bytes: bytes) -> SimpleResult:
     """
     1. Доступность услуги для некоторых тарифных планов.
-    Excel: столбцы ТОЛЬКО с точными именами:
+    Excel/CSV: столбцы ТОЛЬКО с точными именами:
       - Addons name, Addons ID, Имя услуги, ID услуги
     Выход: ZIP с productOfferingGroup/<Addons ID>.json
     """
     try:
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")
         expected = ["Addons name", "Addons ID", "Имя услуги", "ID услуги"]
-        df = df[expected].copy()
+        df = _read_table(excel_bytes, expected)
         for c in expected:
             df[c] = df[c].apply(_normalize_str)
 
@@ -215,7 +242,7 @@ def generate_addon_from_excel(excel_bytes: bytes) -> SimpleResult:
 def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
     """
     2. Добавление услуги в существующие планы.
-    Excel: Addons ID, Имя услуги, ID услуги
+    Excel/CSV: Addons ID, Имя услуги, ID услуги
     """
     try:
         names, blob = _read_zip(zip_bytes)
@@ -223,8 +250,9 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
         if not json_files:
             return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
 
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["Addons ID", "Имя услуги", "ID услуги"]]
-        for c in ["Addons ID", "Имя услуги", "ID услуги"]:
+        expected = ["Addons ID", "Имя услуги", "ID услуги"]
+        df = _read_table(excel_bytes, expected)
+        for c in expected:
             df[c] = df[c].apply(_normalize_str)
         df = df[(df["Addons ID"] != "") & (df["ID услуги"] != "")]
         service_map = df.groupby("Addons ID")[["Имя услуги", "ID услуги"]].apply(lambda x: x.to_dict("records")).to_dict()
@@ -233,6 +261,7 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
         counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
 
         found_ids = set()
+        skipped_rows: List[Dict[str, str]] = []  # детали пропусков
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -258,6 +287,12 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
                     continue
                 if sid in existing:
                     counts["skipped_existing"] += 1
+                    skipped_rows.append({
+                        "json_id": json_id,
+                        "service_id": sid,
+                        "service_name": sname,
+                        "reason": "already_exists_in_group"
+                    })
                 else:
                     offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
                     existing.add(sid)
@@ -273,11 +308,12 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
             if want_id not in found_ids:
                 counts["not_found_json_id"] += 1
 
+        details = {"skipped_existing": skipped_rows}
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts)
+            return SimpleResult(True, "Нет изменений", None, counts, details=details)
 
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts)
+        return SimpleResult(True, "Готово", buf, counts, details=details)
     except KeyError as e:
         return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
     except Exception as e:
@@ -287,7 +323,7 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
 def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
     """
     3. Экспайр услуги.
-    Excel: json_id, service_id
+    Excel/CSV: json_id, service_id
     """
     try:
         names, blob = _read_zip(zip_bytes)
@@ -295,14 +331,23 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
         if not json_files:
             return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
 
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id", "service_id"]]
+        df = _read_table(excel_bytes, ["json_id", "service_id"])
         for c in ["json_id", "service_id"]:
             df[c] = df[c].apply(_normalize_str)
         df = df[(df["json_id"] != "") & (df["service_id"] != "")]
         expire_map = df.groupby("json_id")["service_id"].apply(list).to_dict()
 
         updated: Dict[str, str] = {}
-        counts = {"files_processed": 0, "expired": 0, "already_expired": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+        counts = {
+            "files_processed": 0,
+            "expired": 0,
+            "already_expired": 0,
+            "invalid_target_type": 0,
+            "not_found_json_id": 0,     # отсутствующие файлы
+            "not_found_service_id": 0,  # отсутствующие услуги внутри найденного файла
+        }
+
+        found_ids = set()
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -312,33 +357,37 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
             if not json_id or json_id not in expire_map:
                 continue
 
+            found_ids.add(json_id)
+
             if data.get("purpose") != ["addOn"]:
                 counts["invalid_target_type"] += 1
                 continue
 
             offerings = data.get("productOfferingsInGroup", [])
-            modified = False
+            index_by_id = {_normalize_id(o.get("id", "")): o for o in offerings}
 
+            modified = False
             for sid in expire_map[json_id]:
                 sid = _normalize_id(sid)
-                found = False
-                for o in offerings:
-                    if _normalize_id(o.get("id", "")) == sid:
-                        found = True
-                        if not o.get("expiredForSales", False):
-                            o["expiredForSales"] = True
-                            counts["expired"] += 1
-                            modified = True
-                        else:
-                            counts["already_expired"] += 1
-                        break
-                if not found:
-                    counts["not_found_json_id"] += 1
+                o = index_by_id.get(sid)
+                if o is None:
+                    counts["not_found_service_id"] += 1
+                    continue
+                if not o.get("expiredForSales", False):
+                    o["expiredForSales"] = True
+                    counts["expired"] += 1
+                    modified = True
+                else:
+                    counts["already_expired"] += 1
 
             if modified:
                 data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
                 updated[path] = _json_dumps_stable(data)
                 counts["files_processed"] += 1
+
+        for want_id in expire_map.keys():
+            if want_id not in found_ids:
+                counts["not_found_json_id"] += 1
 
         if not updated:
             return SimpleResult(True, "Нет изменений", None, counts)
@@ -354,10 +403,10 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
 def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id: str) -> SimpleResult:
     """
     1. Добавление перехода для одного тарифного плана.
-    Excel: offer_id (одна колонка)
+    Excel/CSV: offer_id (одна колонка)
     """
     try:
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["offer_id"]]
+        df = _read_table(excel_bytes, ["offer_id"])
         df["offer_id"] = df["offer_id"].apply(_normalize_str)
         df = df[df["offer_id"] != ""]
         if df.empty:
@@ -380,7 +429,7 @@ def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id:
 def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str) -> SimpleResult:
     """
     2. Добавление нового тарифа в переходы.
-    Excel: json_id (список переходов)
+    Excel/CSV: json_id (список переходов)
     """
     try:
         names, blob = _read_zip(zip_bytes)
@@ -388,13 +437,15 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
         if not json_files:
             return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
 
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id"]]
+        df = _read_table(excel_bytes, ["json_id"])
         df["json_id"] = df["json_id"].apply(_normalize_str)
         target_ids = {x for x in df["json_id"].tolist() if x}
 
         updated: Dict[str, str] = {}
         counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
         seen = set()
+
+        skipped_rows: List[Dict[str, str]] = []  # детали пропусков
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -411,11 +462,18 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
 
             offerings = data.get("productOfferingsInGroup", [])
             existing = {_normalize_id(o.get("id", "")) for o in offerings}
-            if _normalize_id(offer_id) in existing:
+            want = _normalize_id(offer_id)
+
+            if want in existing:
                 counts["skipped_existing"] += 1
+                skipped_rows.append({
+                    "json_id": jid,
+                    "offer_id": want,
+                    "reason": "already_exists_in_group"
+                })
                 continue
 
-            offerings.append(_make_offering(_normalize_id(offer_id)))
+            offerings.append(_make_offering(want))
             data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
             updated[path] = _json_dumps_stable(data)
             counts["added"] += 1
@@ -425,11 +483,12 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
             if want not in seen:
                 counts["not_found_json_id"] += 1
 
+        details = {"skipped_existing": skipped_rows}
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts)
+            return SimpleResult(True, "Нет изменений", None, counts, details=details)
 
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts)
+        return SimpleResult(True, "Готово", buf, counts, details=details)
     except KeyError as e:
         return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
     except Exception as e:
@@ -439,7 +498,7 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
 def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
     """
     3. Экспайр тарифного плана в переходах.
-    Excel: json_id, offer_id
+    Excel/CSV: json_id, offer_id
     """
     try:
         names, blob = _read_zip(zip_bytes)
@@ -447,14 +506,23 @@ def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleR
         if not json_files:
             return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
 
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["json_id", "offer_id"]]
+        df = _read_table(excel_bytes, ["json_id", "offer_id"])
         for c in ["json_id", "offer_id"]:
             df[c] = df[c].apply(_normalize_str)
         df = df[(df["json_id"] != "") & (df["offer_id"] != "")]
         expire_map = df.groupby("json_id")["offer_id"].apply(list).to_dict()
 
         updated: Dict[str, str] = {}
-        counts = {"files_processed": 0, "expired": 0, "already_expired": 0, "not_found_json_id": 0, "invalid_target_type": 0}
+        counts = {
+            "files_processed": 0,
+            "expired": 0,
+            "already_expired": 0,
+            "invalid_target_type": 0,
+            "not_found_json_id": 0,   # отсутствующие файлы
+            "not_found_offer_id": 0,  # отсутствующие офферы внутри найденного файла
+        }
+
+        found_ids = set()
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -464,33 +532,37 @@ def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleR
             if not jid or jid not in expire_map:
                 continue
 
+            found_ids.add(jid)
+
             if data.get("purpose") != ["replaceOffer"]:
                 counts["invalid_target_type"] += 1
                 continue
 
             offerings = data.get("productOfferingsInGroup", [])
-            modified = False
+            index_by_id = {_normalize_id(o.get("id", "")): o for o in offerings}
 
+            modified = False
             for oid in expire_map[jid]:
                 oid = _normalize_id(oid)
-                found = False
-                for o in offerings:
-                    if _normalize_id(o.get("id", "")) == oid:
-                        found = True
-                        if not o.get("expiredForSales", False):
-                            o["expiredForSales"] = True
-                            counts["expired"] += 1
-                            modified = True
-                        else:
-                            counts["already_expired"] += 1
-                        break
-                if not found:
-                    counts["not_found_json_id"] += 1
+                o = index_by_id.get(oid)
+                if o is None:
+                    counts["not_found_offer_id"] += 1
+                    continue
+                if not o.get("expiredForSales", False):
+                    o["expiredForSales"] = True
+                    counts["expired"] += 1
+                    modified = True
+                else:
+                    counts["already_expired"] += 1
 
             if modified:
                 data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
                 updated[path] = _json_dumps_stable(data)
                 counts["files_processed"] += 1
+
+        for want_id in expire_map.keys():
+            if want_id not in found_ids:
+                counts["not_found_json_id"] += 1
 
         if not updated:
             return SimpleResult(True, "Нет изменений", None, counts)
@@ -506,10 +578,10 @@ def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleR
 def generate_categories_from_excel(excel_bytes: bytes) -> SimpleResult:
     """
     Категории (ProductOfferingCategory).
-    Excel: offer_id, category_id (replace-модель)
+    Excel/CSV: offer_id, category_id (replace-модель)
     """
     try:
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine="openpyxl")[["offer_id", "category_id"]]
+        df = _read_table(excel_bytes, ["offer_id", "category_id"])
         for c in ["offer_id", "category_id"]:
             df[c] = df[c].apply(_normalize_str)
         df = df[(df["offer_id"] != "") & (df["category_id"] != "")]
@@ -557,6 +629,24 @@ def _show_counts(counts: Dict[str, int]):
             with cols[j]:
                 st.metric(k, v)
 
+def _show_skipped_details(details: Optional[Dict[str, Any]], filename: str = "skipped_details.csv"):
+    if not details:
+        return
+    rows = details.get("skipped_existing") or []
+    if not rows:
+        return
+    with st.expander(f"Детали пропусков (skipped_existing): {len(rows)}", expanded=False):
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, height=320)
+        csv_buf = io.StringIO()
+        df.to_csv(csv_buf, index=False)
+        st.download_button(
+            "Скачать детали (CSV)",
+            csv_buf.getvalue().encode("utf-8-sig"),
+            file_name=filename,
+            mime="text/csv",
+        )
+
 # --------- Раздел 1: Услуги ----------
 if main_section == "Услуги (AddOns)":
     st.header("Работа с услугами")
@@ -571,11 +661,11 @@ if main_section == "Услуги (AddOns)":
 
     if scenario.startswith("1."):
         st.subheader("Доступность услуги для некоторых тарифных планов")
-        st.info("Excel должен содержать столбцы: Addons name, Addons ID, Имя услуги, ID услуги")
-        excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+        st.info("Excel/CSV должен содержать столбцы: Addons name, Addons ID, Имя услуги, ID услуги")
+        excel_file = st.file_uploader("Загрузите Excel/CSV", type=["xlsx", "xls", "csv"])
         if st.button("Выполнить"):
             if not excel_file:
-                st.error("Загрузите Excel")
+                st.error("Загрузите Excel/CSV")
             else:
                 with st.spinner("Обработка..."):
                     res = generate_addon_from_excel(excel_file.read())
@@ -588,12 +678,12 @@ if main_section == "Услуги (AddOns)":
 
     elif scenario.startswith("2."):
         st.subheader("Добавление услуги в существующие планы")
-        st.info("Excel должен содержать столбцы: Addons ID, Имя услуги, ID услуги")
+        st.info("Excel/CSV должен содержать столбцы: Addons ID, Имя услуги, ID услуги")
         zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
-        excel_file = st.file_uploader("Загрузите Excel с услугами", type=["xlsx", "xls"])
+        excel_file = st.file_uploader("Загрузите Excel/CSV с услугами", type=["xlsx", "xls", "csv"])
         if st.button("Выполнить"):
             if not zip_file or not excel_file:
-                st.error("Загрузите ZIP и Excel")
+                st.error("Загрузите ZIP и Excel/CSV")
             else:
                 with st.spinner("Обработка..."):
                     res = add_services_to_existing_pogs(zip_file.read(), excel_file.read())
@@ -602,17 +692,19 @@ if main_section == "Услуги (AddOns)":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
+                    if res.details:
+                        _show_skipped_details(res.details, filename="skipped_services_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_addons.zip", "application/zip")
 
     else:
         st.subheader("Экспайр услуги")
-        st.info("Excel должен содержать столбцы: json_id, service_id")
+        st.info("Excel/CSV должен содержать столбцы: json_id, service_id")
         zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
-        excel_file = st.file_uploader("Загрузите Excel со списком к экспайру", type=["xlsx", "xls"])
+        excel_file = st.file_uploader("Загрузите Excel/CSV со списком к экспайру", type=["xlsx", "xls", "csv"])
         if st.button("Выполнить"):
             if not zip_file or not excel_file:
-                st.error("Загрузите ZIP и Excel")
+                st.error("Загрузите ZIP и Excel/CSV")
             else:
                 with st.spinner("Обработка..."):
                     res = expire_services_in_pogs(zip_file.read(), excel_file.read())
@@ -638,15 +730,16 @@ elif main_section == "Переходы тарифных планов":
 
     if scenario.startswith("1."):
         st.subheader("Создать новый переход")
-        st.info("Excel должен содержать столбец: offer_id")
-        excel_file = st.file_uploader("Загрузите Excel с offer_id", type=["xlsx", "xls"])
+        st.info("Excel/CSV должен содержать столбец: offer_id")
+        excel_file = st.file_uploader("Загрузите Excel/CSV с offer_id", type=["xlsx", "xls", "csv"])
         col1, col2 = st.columns(2)
         with col1:
             json_name = st.text_input("Название перехода", placeholder="Replace for ...")
+        with col2:
             json_id = st.text_input("ID перехода")
         if st.button("Выполнить"):
             if not excel_file or not json_name or not json_id:
-                st.error("Заполните все поля и загрузите Excel")
+                st.error("Заполните все поля и загрузите Excel/CSV")
             else:
                 with st.spinner("Обработка..."):
                     res = create_replace_offer_from_excel(excel_file.read(), json_name, json_id)
@@ -659,9 +752,9 @@ elif main_section == "Переходы тарифных планов":
 
     elif scenario.startswith("2."):
         st.subheader("Добавить тариф в переходы")
-        st.info("Excel должен содержать столбец: json_id (ID перехода)")
+        st.info("Excel/CSV должен содержать столбец: json_id (ID перехода)")
         zip_file = st.file_uploader("Загрузите ZIP с переходами", type=["zip"])
-        excel_file = st.file_uploader("Загрузите Excel со списком переходов", type=["xlsx", "xls"])
+        excel_file = st.file_uploader("Загрузите Excel/CSV со списком переходов", type=["xlsx", "xls", "csv"])
         offer_id = st.text_input("ID тарифного плана (offer_id)")
         if st.button("Выполнить"):
             if not zip_file or not excel_file or not offer_id:
@@ -674,17 +767,19 @@ elif main_section == "Переходы тарифных планов":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
+                    if res.details:
+                        _show_skipped_details(res.details, filename="skipped_offers_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_replace_offers.zip", "application/zip")
 
     else:
         st.subheader("Экспайр тарифа в переходах")
-        st.info("Excel должен содержать столбцы: json_id, offer_id")
+        st.info("Excel/CSV должен содержать столбцы: json_id, offer_id")
         zip_file = st.file_uploader("Загрузите ZIP с переходами", type=["zip"])
-        excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+        excel_file = st.file_uploader("Загрузите Excel/CSV", type=["xlsx", "xls", "csv"])
         if st.button("Выполнить"):
             if not zip_file or not excel_file:
-                st.error("Загрузите ZIP и Excel")
+                st.error("Загрузите ZIP и Excel/CSV")
             else:
                 with st.spinner("Обработка..."):
                     res = expire_offer_in_transitions(zip_file.read(), excel_file.read())
@@ -699,12 +794,12 @@ elif main_section == "Переходы тарифных планов":
 # --------- Раздел 3: Категории ----------
 else:
     st.header("Категории (ProductOfferingCategory)")
-    st.subheader("Сгенерировать категории из Excel")
-    st.info("Excel должен содержать столбцы: offer_id, category_id (несколько строк на один offer_id объединяются)")
-    excel_file = st.file_uploader("Загрузите Excel", type=["xlsx", "xls"])
+    st.subheader("Сгенерировать категории из Excel/CSV")
+    st.info("Excel/CSV должен содержать столбцы: offer_id, category_id (несколько строк на один offer_id объединяются)")
+    excel_file = st.file_uploader("Загрузите Excel/CSV", type=["xlsx", "xls", "csv"])
     if st.button("Выполнить"):
         if not excel_file:
-            st.error("Загрузите Excel")
+            st.error("Загрузите Excel/CSV")
         else:
             with st.spinner("Обработка..."):
                 res = generate_categories_from_excel(excel_file.read())
