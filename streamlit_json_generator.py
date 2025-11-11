@@ -3,7 +3,7 @@
 =======================================
 Простой Streamlit-инструмент для работы с Product Offering Group и Category.
 Минимальный UI: одна кнопка "Выполнить", счётчики, скачивание ZIP.
-+ Детализация пропусков (skipped_existing) и выгрузка CSV.
+Поддержка детальной информации по skipped_existing + CSV.
 """
 
 import io
@@ -56,7 +56,7 @@ def _json_dumps_stable(obj: Any) -> str:
 
 def _read_table(excel_bytes: bytes, expected_cols: List[str]) -> pd.DataFrame:
     """
-    Универсальный ридер: пробует XLSX/XLS, при ошибке — CSV (UTF-8/auto).
+    Универсальный ридер: пробует XLSX/XLS (openpyxl), при ошибке — CSV (UTF-8/auto; затем ;).
     Строго проверяет наличие expected_cols.
     """
     buf = io.BytesIO(excel_bytes)
@@ -261,7 +261,7 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
         counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
 
         found_ids = set()
-        skipped_rows: List[Dict[str, str]] = []  # детали пропусков
+        skipped_rows: List[Dict[str, str]] = []  # детальные пропуски
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -286,7 +286,7 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
                 if not sid:
                     continue
                 if sid in existing:
-                    counts["skipped_existing"] += 1
+                    # накапливаем деталь (счётчик посчитаем после)
                     skipped_rows.append({
                         "json_id": json_id,
                         "service_id": sid,
@@ -308,7 +308,10 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
             if want_id not in found_ids:
                 counts["not_found_json_id"] += 1
 
+        # счётчик = длина деталей
+        counts["skipped_existing"] = len(skipped_rows)
         details = {"skipped_existing": skipped_rows}
+
         if not updated:
             return SimpleResult(True, "Нет изменений", None, counts, details=details)
 
@@ -343,8 +346,9 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
             "expired": 0,
             "already_expired": 0,
             "invalid_target_type": 0,
-            "not_found_json_id": 0,     # отсутствующие файлы
-            "not_found_service_id": 0,  # отсутствующие услуги внутри найденного файла
+            # корректные и разделённые метрики
+            "not_found_json_id": 0,     # Excel-ссылка на отсутствующий JSON-файл
+            "not_found_service_id": 0,  # отсутствующая услуга внутри найденного JSON
         }
 
         found_ids = set()
@@ -445,7 +449,8 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
         counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
         seen = set()
 
-        skipped_rows: List[Dict[str, str]] = []  # детали пропусков
+        skipped_rows: List[Dict[str, str]] = []  # детальные пропуски
+        want = _normalize_id(offer_id)
 
         for path in json_files:
             data = _load_json(blob[path])
@@ -462,10 +467,8 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
 
             offerings = data.get("productOfferingsInGroup", [])
             existing = {_normalize_id(o.get("id", "")) for o in offerings}
-            want = _normalize_id(offer_id)
 
             if want in existing:
-                counts["skipped_existing"] += 1
                 skipped_rows.append({
                     "json_id": jid,
                     "offer_id": want,
@@ -479,11 +482,14 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
             counts["added"] += 1
             counts["files_processed"] += 1
 
-        for want in target_ids:
-            if want not in seen:
+        for want_id in target_ids:
+            if want_id not in seen:
                 counts["not_found_json_id"] += 1
 
+        # счётчик = длина деталей
+        counts["skipped_existing"] = len(skipped_rows)
         details = {"skipped_existing": skipped_rows}
+
         if not updated:
             return SimpleResult(True, "Нет изменений", None, counts, details=details)
 
@@ -518,8 +524,8 @@ def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleR
             "expired": 0,
             "already_expired": 0,
             "invalid_target_type": 0,
-            "not_found_json_id": 0,   # отсутствующие файлы
-            "not_found_offer_id": 0,  # отсутствующие офферы внутри найденного файла
+            "not_found_json_id": 0,   # Excel-ссылка на отсутствующий JSON-файл
+            "not_found_offer_id": 0,  # отсутствующий offer внутри найденного JSON
         }
 
         found_ids = set()
@@ -630,12 +636,11 @@ def _show_counts(counts: Dict[str, int]):
                 st.metric(k, v)
 
 def _show_skipped_details(details: Optional[Dict[str, Any]], filename: str = "skipped_details.csv"):
-    if not details:
-        return
-    rows = details.get("skipped_existing") or []
-    if not rows:
-        return
+    rows = (details or {}).get("skipped_existing") or []
     with st.expander(f"Детали пропусков (skipped_existing): {len(rows)}", expanded=False):
+        if not rows:
+            st.caption("Нет пропусков.")
+            return
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, height=320)
         csv_buf = io.StringIO()
@@ -692,8 +697,7 @@ if main_section == "Услуги (AddOns)":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
-                    if res.details:
-                        _show_skipped_details(res.details, filename="skipped_services_existing.csv")
+                    _show_skipped_details(res.details, filename="skipped_services_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_addons.zip", "application/zip")
 
@@ -767,8 +771,7 @@ elif main_section == "Переходы тарифных планов":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
-                    if res.details:
-                        _show_skipped_details(res.details, filename="skipped_offers_existing.csv")
+                    _show_skipped_details(res.details, filename="skipped_offers_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_replace_offers.zip", "application/zip")
 
