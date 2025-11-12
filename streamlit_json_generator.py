@@ -2,16 +2,16 @@
 Генератор и обновление JSON (один файл)
 =======================================
 Простой Streamlit-инструмент для работы с Product Offering Group и Category.
-Минимальный UI: одна кнопка "Выполнить", счётчики, скачивание ZIP.
-Поддержка детальной информации по skipped_existing + CSV.
+Минимальный UI + детальный вывод всех ошибок и пропусков.
 """
 
 import io
 import json
 import zipfile
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Optional
+from enum import Enum
 
 import pandas as pd
 import streamlit as st
@@ -25,6 +25,46 @@ POC_DIR = "productOfferingCategory"
 
 SAFE_NAME_PATTERN = re.compile(r"[^0-9A-Za-z_\-\u0400-\u04FF]")
 WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+# =========================
+# ТИПЫ ПРОБЛЕМ
+# =========================
+class IssueType(Enum):
+    ALREADY_EXISTS = "already_exists"
+    ALREADY_EXPIRED = "already_expired"
+    DUPLICATE_IN_SOURCE = "duplicate_in_source"
+    NOT_FOUND_JSON_ID = "not_found_json_id"
+    NOT_FOUND_SERVICE_ID = "not_found_service_id"
+    NOT_FOUND_OFFER_ID = "not_found_offer_id"
+    INVALID_TARGET_TYPE = "invalid_target_type"
+    EMPTY_ID = "empty_id"
+    INVALID_JSON = "invalid_json"
+    MISSING_FIELD = "missing_field"
+
+
+@dataclass
+class Issue:
+    """Детальная информация об ошибке или пропуске"""
+    type: IssueType
+    severity: str  # "warning", "error", "info"
+    message: str
+    context: Dict[str, Any] = field(default_factory=dict)
+    row_number: Optional[int] = None
+    file_path: Optional[str] = None
+
+
+@dataclass
+class SimpleResult:
+    ok: bool
+    msg: str
+    zip_data: Optional[io.BytesIO]
+    counts: Dict[str, int]
+    issues: List[Issue] = field(default_factory=list)
+    details: Optional[Dict[str, Any]] = None
+    
+    def add_issue(self, issue: Issue):
+        self.issues.append(issue)
 
 
 # =========================
@@ -54,40 +94,64 @@ def _json_dumps_stable(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=4, sort_keys=True)
 
 
-def _read_table(excel_bytes: bytes, expected_cols: List[str]) -> pd.DataFrame:
-    """
-    Универсальный ридер: пробует XLSX/XLS (openpyxl), при ошибке — CSV (UTF-8/auto; затем ;).
-    Строго проверяет наличие expected_cols.
-    """
+def _read_table(excel_bytes: bytes, expected_cols: List[str]) -> Tuple[pd.DataFrame, List[Issue]]:
+    """Универсальный ридер с отслеживанием проблем"""
+    issues = []
     buf = io.BytesIO(excel_bytes)
 
-    # Пробуем Excel
     try:
         df = pd.read_excel(buf, engine="openpyxl")
-    except Exception:
-        # Fallback: CSV с автодетектом
+    except Exception as e:
+        issues.append(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="info",
+            message=f"Не Excel, пробуем CSV: {str(e)[:50]}"
+        ))
         buf.seek(0)
         try:
             df = pd.read_csv(buf)
         except Exception:
             buf.seek(0)
-            df = pd.read_csv(buf, sep=";", engine="python")
+            try:
+                df = pd.read_csv(buf, sep=";", engine="python")
+            except Exception as e2:
+                issues.append(Issue(
+                    type=IssueType.INVALID_JSON,
+                    severity="error",
+                    message=f"Не удалось прочитать файл: {str(e2)}"
+                ))
+                raise
 
     missing = [c for c in expected_cols if c not in df.columns]
     if missing:
+        issues.append(Issue(
+            type=IssueType.MISSING_FIELD,
+            severity="error",
+            message=f"Нет столбца(ов): {', '.join(missing)}",
+            context={"missing": missing, "available": list(df.columns)}
+        ))
         raise KeyError(f"Нет требуемого столбца(ов): {', '.join(missing)}")
 
-    return df[expected_cols].copy()
+    return df[expected_cols].copy(), issues
 
 
 # =========================
 # ZIP/JSON I/O
 # =========================
-def _read_zip(zip_bytes: bytes) -> Tuple[List[str], Dict[str, bytes]]:
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-        names = zf.namelist()
-        content = {n: zf.read(n) for n in names}
-    return names, content
+def _read_zip(zip_bytes: bytes) -> Tuple[List[str], Dict[str, bytes], List[Issue]]:
+    issues = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            names = zf.namelist()
+            content = {n: zf.read(n) for n in names}
+        return names, content, issues
+    except Exception as e:
+        issues.append(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Ошибка чтения ZIP: {str(e)}"
+        ))
+        raise
 
 
 def _list_json_in_dir(bytes_map: Dict[str, bytes], dir_name: str) -> List[str]:
@@ -95,10 +159,17 @@ def _list_json_in_dir(bytes_map: Dict[str, bytes], dir_name: str) -> List[str]:
     return [n for n in bytes_map if n.startswith(prefix) and n.endswith(".json")]
 
 
-def _load_json(data: bytes) -> Optional[Dict[str, Any]]:
+def _load_json(data: bytes, path: str, issues: List[Issue]) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(data.decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        issues.append(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Невалидный JSON",
+            file_path=path,
+            context={"error": str(e)[:100]}
+        ))
         return None
 
 
@@ -171,46 +242,70 @@ def _build_category(offer_id: str, category_ids: List[str]) -> Dict[str, Any]:
 
 
 # =========================
-# РЕЗУЛЬТАТ ОПЕРАЦИЙ
-# =========================
-@dataclass
-class SimpleResult:
-    ok: bool
-    msg: str
-    zip_data: Optional[io.BytesIO]
-    counts: Dict[str, int]
-    details: Optional[Dict[str, Any]] = None
-
-
-# =========================
 # ОПЕРАЦИИ
 # =========================
 def generate_addon_from_excel(excel_bytes: bytes) -> SimpleResult:
-    """
-    1. Доступность услуги для некоторых тарифных планов.
-    Excel/CSV: столбцы ТОЛЬКО с точными именами:
-      - Addons name, Addons ID, Имя услуги, ID услуги
-    Выход: ZIP с productOfferingGroup/<Addons ID>.json
-    """
+    """1. Доступность услуги для некоторых тарифных планов."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
         expected = ["Addons name", "Addons ID", "Имя услуги", "ID услуги"]
-        df = _read_table(excel_bytes, expected)
+        df, read_issues = _read_table(excel_bytes, expected)
+        result.issues.extend(read_issues)
+        
         for c in expected:
             df[c] = df[c].apply(_normalize_str)
-
+        
+        total_rows = len(df)
+        
+        # Отслеживание пустых ID
+        for idx, row in df.iterrows():
+            if not row["Addons ID"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой Addons ID",
+                    row_number=idx + 2,
+                    context={"addons_name": row["Addons name"]}
+                ))
+            if not row["ID услуги"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой ID услуги",
+                    row_number=idx + 2,
+                    context={"service_name": row["Имя услуги"]}
+                ))
+        
         df = df[(df["Addons ID"] != "") & (df["ID услуги"] != "")]
+        
         if df.empty:
-            return SimpleResult(False, "В Excel нет валидных строк", None, {})
-
+            result.msg = "В Excel нет валидных строк"
+            return result
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        result.counts["skipped_rows"] = total_rows - len(df)
+        
         groups = df.groupby(["Addons name", "Addons ID"])
         buf = io.BytesIO()
         created_jsons = 0
         services_total = 0
-
+        
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for (json_name, json_id), g in groups:
-                # дедуп по ID услуги
+                initial_count = len(g)
                 g = g.drop_duplicates(subset=["ID услуги"])
+                duplicates_count = initial_count - len(g)
+                
+                if duplicates_count > 0:
+                    result.add_issue(Issue(
+                        type=IssueType.DUPLICATE_IN_SOURCE,
+                        severity="info",
+                        message=f"Удалено дубликатов: {duplicates_count}",
+                        context={"addons_id": json_id, "addons_name": json_name}
+                    ))
+                
                 offerings = []
                 for _, r in g.iterrows():
                     sid = _normalize_id(r["ID услуги"])
@@ -218,75 +313,136 @@ def generate_addon_from_excel(excel_bytes: bytes) -> SimpleResult:
                     if not sid:
                         continue
                     offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
+                
                 if not offerings:
                     continue
+                
                 pog = _build_pog_addon(_normalize_str(json_name), _normalize_id(json_id), DEFAULT_LOCALE, offerings)
                 zf.writestr(f"{POG_DIR}/{_safe_name(json_id)}.json", _json_dumps_stable(pog))
                 created_jsons += 1
                 services_total += len(offerings)
-
+        
         if created_jsons == 0:
-            return SimpleResult(False, "Не удалось построить ни одного JSON", None, {})
-
+            result.msg = "Не удалось построить ни одного JSON"
+            return result
+        
+        result.counts["created_jsons"] = created_jsons
+        result.counts["services_total"] = services_total
         buf.seek(0)
-        return SimpleResult(True, "Готово", buf, {
-            "created_jsons": created_jsons,
-            "services_total": services_total
-        })
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
-    """
-    2. Добавление услуги в существующие планы.
-    Excel/CSV: Addons ID, Имя услуги, ID услуги
-    """
+    """2. Добавление услуги в существующие планы."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        names, blob = _read_zip(zip_bytes)
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
         json_files = _list_json_in_dir(blob, POG_DIR)
         if not json_files:
-            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
-
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
         expected = ["Addons ID", "Имя услуги", "ID услуги"]
-        df = _read_table(excel_bytes, expected)
+        df, read_issues = _read_table(excel_bytes, expected)
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
+        
         for c in expected:
             df[c] = df[c].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["Addons ID"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой Addons ID",
+                    row_number=idx + 2
+                ))
+            if not row["ID услуги"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой ID услуги",
+                    row_number=idx + 2
+                ))
+        
         df = df[(df["Addons ID"] != "") & (df["ID услуги"] != "")]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
         service_map = df.groupby("Addons ID")[["Имя услуги", "ID услуги"]].apply(lambda x: x.to_dict("records")).to_dict()
-
+        
         updated: Dict[str, str] = {}
-        counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
-
         found_ids = set()
-        skipped_rows: List[Dict[str, str]] = []  # детальные пропуски
-
+        skipped_rows: List[Dict[str, str]] = []
+        
         for path in json_files:
-            data = _load_json(blob[path])
+            data = _load_json(blob[path], path, result.issues)
             if not data:
                 continue
+            
             json_id = _normalize_id(data.get("id", ""))
-            if not json_id or json_id not in service_map:
+            if not json_id:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="error",
+                    message="JSON без ID",
+                    file_path=path
+                ))
                 continue
-
+            
+            if json_id not in service_map:
+                continue
+            
             found_ids.add(json_id)
+            
             if data.get("purpose") != ["addOn"]:
-                counts["invalid_target_type"] += 1
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается addOn)",
+                    file_path=path,
+                    context={"json_id": json_id, "purpose": data.get("purpose")}
+                ))
                 continue
-
+            
             offerings = data.get("productOfferingsInGroup", [])
             existing = {_normalize_id(o.get("id", "")) for o in offerings}
-
+            
             modified = False
             for rec in service_map[json_id]:
                 sid = _normalize_id(rec["ID услуги"])
                 sname = _normalize_str(rec["Имя услуги"])
                 if not sid:
                     continue
+                
                 if sid in existing:
-                    # накапливаем деталь (счётчик посчитаем после)
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_EXISTS,
+                        severity="info",
+                        message=f"Услуга уже существует",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid, "service_name": sname}
+                    ))
                     skipped_rows.append({
                         "json_id": json_id,
                         "service_id": sid,
@@ -296,335 +452,562 @@ def add_services_to_existing_pogs(zip_bytes: bytes, excel_bytes: bytes) -> Simpl
                 else:
                     offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
                     existing.add(sid)
-                    counts["added"] += 1
                     modified = True
-
+            
             if modified:
                 data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
                 updated[path] = _json_dumps_stable(data)
-                counts["files_processed"] += 1
-
+        
         for want_id in service_map.keys():
             if want_id not in found_ids:
-                counts["not_found_json_id"] += 1
-
-        # счётчик = длина деталей
-        counts["skipped_existing"] = len(skipped_rows)
-        details = {"skipped_existing": skipped_rows}
-
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"addons_id": want_id}
+                ))
+        
+        result.counts["files_processed"] = len(updated)
+        result.counts["added"] = sum(1 for i in result.issues if i.type == IssueType.ALREADY_EXISTS)
+        result.counts["skipped_existing"] = len(skipped_rows)
+        result.details = {"skipped_existing": skipped_rows}
+        
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts, details=details)
-
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts, details=details)
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
-    """
-    3. Экспайр услуги.
-    Excel/CSV: json_id, service_id
-    """
+    """3. Экспайр услуги."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        names, blob = _read_zip(zip_bytes)
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
         json_files = _list_json_in_dir(blob, POG_DIR)
         if not json_files:
-            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
-
-        df = _read_table(excel_bytes, ["json_id", "service_id"])
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
+        df, read_issues = _read_table(excel_bytes, ["json_id", "service_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
+        
         for c in ["json_id", "service_id"]:
             df[c] = df[c].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["json_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой json_id",
+                    row_number=idx + 2
+                ))
+            if not row["service_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой service_id",
+                    row_number=idx + 2
+                ))
+        
         df = df[(df["json_id"] != "") & (df["service_id"] != "")]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
         expire_map = df.groupby("json_id")["service_id"].apply(list).to_dict()
-
+        
         updated: Dict[str, str] = {}
-        counts = {
-            "files_processed": 0,
-            "expired": 0,
-            "already_expired": 0,
-            "invalid_target_type": 0,
-            # корректные и разделённые метрики
-            "not_found_json_id": 0,     # Excel-ссылка на отсутствующий JSON-файл
-            "not_found_service_id": 0,  # отсутствующая услуга внутри найденного JSON
-        }
-
         found_ids = set()
-
+        
         for path in json_files:
-            data = _load_json(blob[path])
+            data = _load_json(blob[path], path, result.issues)
             if not data:
                 continue
+            
             json_id = _normalize_id(data.get("id", ""))
             if not json_id or json_id not in expire_map:
                 continue
-
+            
             found_ids.add(json_id)
-
+            
             if data.get("purpose") != ["addOn"]:
-                counts["invalid_target_type"] += 1
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается addOn)",
+                    file_path=path,
+                    context={"json_id": json_id}
+                ))
                 continue
-
+            
             offerings = data.get("productOfferingsInGroup", [])
             index_by_id = {_normalize_id(o.get("id", "")): o for o in offerings}
-
+            
             modified = False
             for sid in expire_map[json_id]:
                 sid = _normalize_id(sid)
                 o = index_by_id.get(sid)
                 if o is None:
-                    counts["not_found_service_id"] += 1
+                    result.add_issue(Issue(
+                        type=IssueType.NOT_FOUND_SERVICE_ID,
+                        severity="error",
+                        message=f"Услуга не найдена",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid}
+                    ))
                     continue
+                
                 if not o.get("expiredForSales", False):
                     o["expiredForSales"] = True
-                    counts["expired"] += 1
                     modified = True
                 else:
-                    counts["already_expired"] += 1
-
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_EXPIRED,
+                        severity="info",
+                        message=f"Услуга уже экспайрнута",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid}
+                    ))
+            
             if modified:
                 data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
                 updated[path] = _json_dumps_stable(data)
-                counts["files_processed"] += 1
-
+        
         for want_id in expire_map.keys():
             if want_id not in found_ids:
-                counts["not_found_json_id"] += 1
-
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"json_id": want_id}
+                ))
+        
+        result.counts["files_processed"] = len(updated)
+        result.counts["expired"] = sum(1 for i in result.issues if i.type == IssueType.ALREADY_EXPIRED)
+        
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts)
-
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts)
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id: str) -> SimpleResult:
-    """
-    1. Добавление перехода для одного тарифного плана.
-    Excel/CSV: offer_id (одна колонка)
-    """
+    """1. Добавление перехода для одного тарифного плана."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        df = _read_table(excel_bytes, ["offer_id"])
+        df, read_issues = _read_table(excel_bytes, ["offer_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
         df["offer_id"] = df["offer_id"].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["offer_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой offer_id",
+                    row_number=idx + 2
+                ))
+        
         df = df[df["offer_id"] != ""]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
         if df.empty:
-            return SimpleResult(False, "В Excel нет валидных строк", None, {})
-
+            result.msg = "В Excel нет валидных строк"
+            return result
+        
         offers = [_make_offering(_normalize_id(r["offer_id"])) for _, r in df.iterrows() if _normalize_id(r["offer_id"])]
         pog = _build_pog_replace(_normalize_str(json_name), _normalize_id(json_id), DEFAULT_LOCALE, offers)
-
+        
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(f"{POG_DIR}/{_safe_name(json_id)}.json", _json_dumps_stable(pog))
         buf.seek(0)
-        return SimpleResult(True, "Готово", buf, {"created_jsons": 1, "offers_total": len(offers)})
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        
+        result.counts["created_jsons"] = 1
+        result.counts["offers_total"] = len(offers)
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str) -> SimpleResult:
-    """
-    2. Добавление нового тарифа в переходы.
-    Excel/CSV: json_id (список переходов)
-    """
+    """2. Добавление нового тарифа в переходы."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        names, blob = _read_zip(zip_bytes)
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
         json_files = _list_json_in_dir(blob, POG_DIR)
         if not json_files:
-            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
-
-        df = _read_table(excel_bytes, ["json_id"])
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
+        df, read_issues = _read_table(excel_bytes, ["json_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
         df["json_id"] = df["json_id"].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["json_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой json_id",
+                    row_number=idx + 2
+                ))
+        
         target_ids = {x for x in df["json_id"].tolist() if x}
-
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(target_ids)
+        
         updated: Dict[str, str] = {}
-        counts = {"files_processed": 0, "added": 0, "skipped_existing": 0, "not_found_json_id": 0, "invalid_target_type": 0}
         seen = set()
-
-        skipped_rows: List[Dict[str, str]] = []  # детальные пропуски
         want = _normalize_id(offer_id)
-
+        skipped_rows: List[Dict[str, str]] = []
+        
         for path in json_files:
-            data = _load_json(blob[path])
+            data = _load_json(blob[path], path, result.issues)
             if not data:
                 continue
+            
             jid = _normalize_id(data.get("id", ""))
             if not jid or jid not in target_ids:
                 continue
-
+            
             seen.add(jid)
+            
             if data.get("purpose") != ["replaceOffer"]:
-                counts["invalid_target_type"] += 1
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается replaceOffer)",
+                    file_path=path,
+                    context={"json_id": jid}
+                ))
                 continue
-
+            
             offerings = data.get("productOfferingsInGroup", [])
             existing = {_normalize_id(o.get("id", "")) for o in offerings}
-
+            
             if want in existing:
+                result.add_issue(Issue(
+                    type=IssueType.ALREADY_EXISTS,
+                    severity="info",
+                    message=f"Тариф уже существует",
+                    file_path=path,
+                    context={"json_id": jid, "offer_id": want}
+                ))
                 skipped_rows.append({
                     "json_id": jid,
                     "offer_id": want,
                     "reason": "already_exists_in_group"
                 })
                 continue
-
+            
             offerings.append(_make_offering(want))
             data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
             updated[path] = _json_dumps_stable(data)
-            counts["added"] += 1
-            counts["files_processed"] += 1
-
+        
         for want_id in target_ids:
             if want_id not in seen:
-                counts["not_found_json_id"] += 1
-
-        # счётчик = длина деталей
-        counts["skipped_existing"] = len(skipped_rows)
-        details = {"skipped_existing": skipped_rows}
-
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"json_id": want_id}
+                ))
+        
+        result.counts["files_processed"] = len(updated)
+        result.counts["added"] = len(updated)
+        result.counts["skipped_existing"] = len(skipped_rows)
+        result.details = {"skipped_existing": skipped_rows}
+        
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts, details=details)
-
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts, details=details)
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
-    """
-    3. Экспайр тарифного плана в переходах.
-    Excel/CSV: json_id, offer_id
-    """
+    """3. Экспайр тарифного плана в переходах."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        names, blob = _read_zip(zip_bytes)
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
         json_files = _list_json_in_dir(blob, POG_DIR)
         if not json_files:
-            return SimpleResult(False, f"В ZIP нет JSON в {POG_DIR}/", None, {})
-
-        df = _read_table(excel_bytes, ["json_id", "offer_id"])
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
+        df, read_issues = _read_table(excel_bytes, ["json_id", "offer_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
+        
         for c in ["json_id", "offer_id"]:
             df[c] = df[c].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["json_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой json_id",
+                    row_number=idx + 2
+                ))
+            if not row["offer_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой offer_id",
+                    row_number=idx + 2
+                ))
+        
         df = df[(df["json_id"] != "") & (df["offer_id"] != "")]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
         expire_map = df.groupby("json_id")["offer_id"].apply(list).to_dict()
-
+        
         updated: Dict[str, str] = {}
-        counts = {
-            "files_processed": 0,
-            "expired": 0,
-            "already_expired": 0,
-            "invalid_target_type": 0,
-            "not_found_json_id": 0,   # Excel-ссылка на отсутствующий JSON-файл
-            "not_found_offer_id": 0,  # отсутствующий offer внутри найденного JSON
-        }
-
         found_ids = set()
-
+        
         for path in json_files:
-            data = _load_json(blob[path])
+            data = _load_json(blob[path], path, result.issues)
             if not data:
                 continue
+            
             jid = _normalize_id(data.get("id", ""))
             if not jid or jid not in expire_map:
                 continue
-
+            
             found_ids.add(jid)
-
+            
             if data.get("purpose") != ["replaceOffer"]:
-                counts["invalid_target_type"] += 1
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается replaceOffer)",
+                    file_path=path,
+                    context={"json_id": jid}
+                ))
                 continue
-
+            
             offerings = data.get("productOfferingsInGroup", [])
             index_by_id = {_normalize_id(o.get("id", "")): o for o in offerings}
-
+            
             modified = False
             for oid in expire_map[jid]:
                 oid = _normalize_id(oid)
                 o = index_by_id.get(oid)
                 if o is None:
-                    counts["not_found_offer_id"] += 1
+                    result.add_issue(Issue(
+                        type=IssueType.NOT_FOUND_OFFER_ID,
+                        severity="error",
+                        message=f"Тариф не найден",
+                        file_path=path,
+                        context={"json_id": jid, "offer_id": oid}
+                    ))
                     continue
+                
                 if not o.get("expiredForSales", False):
                     o["expiredForSales"] = True
-                    counts["expired"] += 1
                     modified = True
                 else:
-                    counts["already_expired"] += 1
-
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_EXPIRED,
+                        severity="info",
+                        message=f"Тариф уже экспайрнут",
+                        file_path=path,
+                        context={"json_id": jid, "offer_id": oid}
+                    ))
+            
             if modified:
                 data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
                 updated[path] = _json_dumps_stable(data)
-                counts["files_processed"] += 1
-
+        
         for want_id in expire_map.keys():
             if want_id not in found_ids:
-                counts["not_found_json_id"] += 1
-
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"json_id": want_id}
+                ))
+        
+        result.counts["files_processed"] = len(updated)
+        result.counts["expired"] = sum(1 for i in result.issues if i.type == IssueType.ALREADY_EXPIRED)
+        
         if not updated:
-            return SimpleResult(True, "Нет изменений", None, counts)
-
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
         buf = _build_new_zip(names, blob, updated)
-        return SimpleResult(True, "Готово", buf, counts)
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 def generate_categories_from_excel(excel_bytes: bytes) -> SimpleResult:
-    """
-    Категории (ProductOfferingCategory).
-    Excel/CSV: offer_id, category_id (replace-модель)
-    """
+    """Категории (ProductOfferingCategory)."""
+    result = SimpleResult(False, "", None, {})
+    
     try:
-        df = _read_table(excel_bytes, ["offer_id", "category_id"])
+        df, read_issues = _read_table(excel_bytes, ["offer_id", "category_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
+        
         for c in ["offer_id", "category_id"]:
             df[c] = df[c].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["offer_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой offer_id",
+                    row_number=idx + 2
+                ))
+            if not row["category_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой category_id",
+                    row_number=idx + 2
+                ))
+        
         df = df[(df["offer_id"] != "") & (df["category_id"] != "")]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
         if df.empty:
-            return SimpleResult(False, "В Excel нет валидных строк", None, {})
-
+            result.msg = "В Excel нет валидных строк"
+            return result
+        
         groups = df.groupby("offer_id")["category_id"].apply(list).to_dict()
         buf = io.BytesIO()
         created = 0
         added = 0
-
+        
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for offer_id, cats in groups.items():
                 cat_json = _build_category(_normalize_id(offer_id), [_normalize_id(x) for x in cats])
                 zf.writestr(f"{POC_DIR}/{_safe_name(offer_id)}.json", _json_dumps_stable(cat_json))
                 created += 1
                 added += len(cat_json["category"])
-
+        
         buf.seek(0)
-        return SimpleResult(True, "Готово", buf, {"created_jsons": created, "added": added})
-    except KeyError as e:
-        return SimpleResult(False, f"Нет требуемого столбца: {e}", None, {})
+        result.counts["created_jsons"] = created
+        result.counts["categories_total"] = added
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
     except Exception as e:
-        return SimpleResult(False, f"Ошибка: {e}", None, {})
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
 
 
 # =========================
-# UI
+# UI ФУНКЦИИ
 # =========================
-st.set_page_config(page_title="Генератор и обновление JSON", layout="wide", initial_sidebar_state="expanded")
-
-st.title("Генератор и обновление JSON")
-st.caption("Управление услугами (AddOns), переходами тарифных планов и категориями")
-
-st.sidebar.title("Навигация")
-main_section = st.sidebar.radio("Выберите раздел:", ["Услуги (AddOns)", "Переходы тарифных планов", "Категории"])
-
 def _show_counts(counts: Dict[str, int]):
     if not counts:
         return
@@ -634,6 +1017,7 @@ def _show_counts(counts: Dict[str, int]):
         for j, (k, v) in enumerate(items[i:i+4]):
             with cols[j]:
                 st.metric(k, v)
+
 
 def _show_skipped_details(details: Optional[Dict[str, Any]], filename: str = "skipped_details.csv"):
     rows = (details or {}).get("skipped_existing") or []
@@ -651,6 +1035,108 @@ def _show_skipped_details(details: Optional[Dict[str, Any]], filename: str = "sk
             file_name=filename,
             mime="text/csv",
         )
+
+
+def _show_all_issues(issues: List[Issue]):
+    """Отображение всех проблем с группировкой по severity"""
+    if not issues:
+        st.success("✅ Ошибок и предупреждений нет")
+        return
+    
+    errors = [i for i in issues if i.severity == "error"]
+    warnings = [i for i in issues if i.severity == "warning"]
+    infos = [i for i in issues if i.severity == "info"]
+    
+    # Краткая сводка
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if errors:
+            st.metric("🔴 Ошибки", len(errors))
+    with col2:
+        if warnings:
+            st.metric("🟡 Предупреждения", len(warnings))
+    with col3:
+        if infos:
+            st.metric("🔵 Информация", len(infos))
+    
+    # Детальные списки
+    if errors:
+        with st.expander(f"🔴 Ошибки ({len(errors)})", expanded=True):
+            _show_issues_table(errors)
+    
+    if warnings:
+        with st.expander(f"🟡 Предупреждения ({len(warnings)})", expanded=False):
+            _show_issues_table(warnings)
+    
+    if infos:
+        with st.expander(f"🔵 Информация ({len(infos)})", expanded=False):
+            _show_issues_table(infos)
+    
+    # Экспорт всех проблем
+    _export_all_issues_csv(issues)
+
+
+def _show_issues_table(issues: List[Issue]):
+    """Таблица проблем"""
+    data = []
+    for issue in issues:
+        row = {
+            "Тип": issue.type.value,
+            "Сообщение": issue.message,
+            "Файл": issue.file_path or "-",
+            "Строка": issue.row_number or "-",
+        }
+        if issue.context:
+            for k, v in issue.context.items():
+                row[k] = str(v)
+        data.append(row)
+    
+    if data:
+        df = pd.DataFrame(data)
+        st.dataframe(df, use_container_width=True, height=min(400, len(df) * 35 + 38))
+
+
+def _export_all_issues_csv(issues: List[Issue]):
+    """Экспорт всех проблем в CSV"""
+    if not issues:
+        return
+    
+    data = []
+    for issue in issues:
+        row = {
+            "severity": issue.severity,
+            "type": issue.type.value,
+            "message": issue.message,
+            "file_path": issue.file_path or "",
+            "row_number": issue.row_number or "",
+        }
+        if issue.context:
+            for k, v in issue.context.items():
+                row[f"context_{k}"] = str(v)
+        data.append(row)
+    
+    df = pd.DataFrame(data)
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False)
+    
+    st.download_button(
+        "Скачать полный отчет (CSV)",
+        csv_buf.getvalue().encode("utf-8-sig"),
+        file_name="full_issues_report.csv",
+        mime="text/csv",
+    )
+
+
+# =========================
+# STREAMLIT UI
+# =========================
+st.set_page_config(page_title="Генератор и обновление JSON", layout="wide", initial_sidebar_state="expanded")
+
+st.title("Генератор и обновление JSON")
+st.caption("Управление услугами (AddOns), переходами тарифных планов и категориями")
+
+st.sidebar.title("Навигация")
+main_section = st.sidebar.radio("Выберите раздел:", ["Услуги (AddOns)", "Переходы тарифных планов", "Категории"])
 
 # --------- Раздел 1: Услуги ----------
 if main_section == "Услуги (AddOns)":
@@ -679,7 +1165,13 @@ if main_section == "Услуги (AddOns)":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
-                    st.download_button("Скачать ZIP", res.zip_data, "addons.zip", "application/zip")
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "addons.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
     elif scenario.startswith("2."):
         st.subheader("Добавление услуги в существующие планы")
@@ -700,6 +1192,11 @@ if main_section == "Услуги (AddOns)":
                     _show_skipped_details(res.details, filename="skipped_services_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_addons.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
     else:
         st.subheader("Экспайр услуги")
@@ -719,6 +1216,11 @@ if main_section == "Услуги (AddOns)":
                     _show_counts(res.counts)
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "expired_addons.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
 # --------- Раздел 2: Переходы ----------
 elif main_section == "Переходы тарифных планов":
@@ -752,7 +1254,13 @@ elif main_section == "Переходы тарифных планов":
                 else:
                     st.success(res.msg)
                     _show_counts(res.counts)
-                    st.download_button("Скачать ZIP", res.zip_data, "replace_offer.zip", "application/zip")
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "replace_offer.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
     elif scenario.startswith("2."):
         st.subheader("Добавить тариф в переходы")
@@ -774,6 +1282,11 @@ elif main_section == "Переходы тарифных планов":
                     _show_skipped_details(res.details, filename="skipped_offers_existing.csv")
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "updated_replace_offers.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
     else:
         st.subheader("Экспайр тарифа в переходах")
@@ -793,6 +1306,11 @@ elif main_section == "Переходы тарифных планов":
                     _show_counts(res.counts)
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "expired_replace_offers.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
 
 # --------- Раздел 3: Категории ----------
 else:
@@ -811,4 +1329,10 @@ else:
             else:
                 st.success(res.msg)
                 _show_counts(res.counts)
-                st.download_button("Скачать ZIP", res.zip_data, "categories.zip", "application/zip")
+                if res.zip_data:
+                    st.download_button("Скачать ZIP", res.zip_data, "categories.zip", "application/zip")
+            
+            # Показываем все проблемы
+            if res.issues:
+                st.markdown("---")
+                _show_all_issues(res.issues)
