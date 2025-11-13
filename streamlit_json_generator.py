@@ -629,6 +629,231 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
     return result
 
 
+def expire_and_add_services(zip_bytes: bytes, expire_excel: bytes, add_excel: bytes) -> SimpleResult:
+    """4. Экспайр + Добавление услуги (две независимые операции)."""
+    result = SimpleResult(False, "", None, {})
+    
+    try:
+        # Читаем ZIP
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
+        # === ЭТАП 1: Читаем файл для экспайра ===
+        df_expire, expire_issues = _read_table(expire_excel, ["ID услуги", "Имя услуги"])
+        result.issues.extend(expire_issues)
+        
+        total_expire_rows = len(df_expire)
+        
+        for c in ["ID услуги", "Имя услуги"]:
+            df_expire[c] = df_expire[c].apply(_normalize_str)
+        
+        for idx, row in df_expire.iterrows():
+            if not row["ID услуги"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой ID услуги для экспайра",
+                    row_number=idx + 2
+                ))
+        
+        df_expire = df_expire[df_expire["ID услуги"] != ""]
+        
+        result.counts["expire_total_rows"] = total_expire_rows
+        result.counts["expire_valid_rows"] = len(df_expire)
+        
+        # Создаем set для быстрого поиска
+        services_to_expire = {_normalize_id(row["ID услуги"]) for _, row in df_expire.iterrows()}
+        
+        # === ЭТАП 2: Читаем файл для добавления ===
+        df_add, add_issues = _read_table(add_excel, ["ID услуги", "Имя услуги"])
+        result.issues.extend(add_issues)
+        
+        total_add_rows = len(df_add)
+        
+        for c in ["ID услуги", "Имя услуги"]:
+            df_add[c] = df_add[c].apply(_normalize_str)
+        
+        for idx, row in df_add.iterrows():
+            if not row["ID услуги"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой ID услуги для добавления",
+                    row_number=idx + 2
+                ))
+        
+        df_add = df_add[df_add["ID услуги"] != ""]
+        
+        result.counts["add_total_rows"] = total_add_rows
+        result.counts["add_valid_rows"] = len(df_add)
+        
+        # Проверка на пересечение (warning)
+        services_to_add_ids = {_normalize_id(row["ID услуги"]) for _, row in df_add.iterrows()}
+        overlap = services_to_expire & services_to_add_ids
+        if overlap:
+            result.add_issue(Issue(
+                type=IssueType.DUPLICATE_IN_SOURCE,
+                severity="warning",
+                message=f"Услуги присутствуют в обоих файлах: {', '.join(list(overlap)[:5])}",
+                context={"overlap_count": len(overlap)}
+            ))
+        
+        # Создаем список услуг для добавления с именами
+        services_to_add = []
+        for _, row in df_add.iterrows():
+            sid = _normalize_id(row["ID услуги"])
+            sname = _normalize_str(row["Имя услуги"])
+            if sid:
+                services_to_add.append({"id": sid, "name": sname})
+        
+        # === ЭТАП 3: Обработка JSON файлов ===
+        updated: Dict[str, str] = {}
+        expired_count = 0
+        added_count = 0
+        skipped_expire_not_found = []
+        skipped_add_existing = []
+        
+        for path in json_files:
+            data = _load_json(blob[path], path, result.issues)
+            if not data:
+                continue
+            
+            json_id = _normalize_id(data.get("id", ""))
+            if not json_id:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="error",
+                    message="JSON без ID",
+                    file_path=path
+                ))
+                continue
+            
+            # Проверяем purpose
+            if data.get("purpose") != ["addOn"]:
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается addOn)",
+                    file_path=path,
+                    context={"json_id": json_id, "purpose": data.get("purpose")}
+                ))
+                continue
+            
+            offerings = data.get("productOfferingsInGroup", [])
+            existing_ids = {_normalize_id(o.get("id", "")) for o in offerings}
+            modified = False
+            
+            # --- Операция 1: Экспайр ---
+            for offering in offerings:
+                sid = _normalize_id(offering.get("id", ""))
+                if sid in services_to_expire:
+                    if not offering.get("expiredForSales", False):
+                        offering["expiredForSales"] = True
+                        expired_count += 1
+                        modified = True
+                    else:
+                        result.add_issue(Issue(
+                            type=IssueType.ALREADY_EXPIRED,
+                            severity="info",
+                            message=f"Услуга уже экспайрнута",
+                            file_path=path,
+                            context={"json_id": json_id, "service_id": sid}
+                        ))
+            
+            # --- Операция 2: Добавление ---
+            for service in services_to_add:
+                sid = service["id"]
+                sname = service["name"]
+                
+                if sid in existing_ids:
+                    skipped_add_existing.append({
+                        "json_id": json_id,
+                        "service_id": sid,
+                        "service_name": sname,
+                        "reason": "already_exists"
+                    })
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_EXISTS,
+                        severity="info",
+                        message=f"Услуга уже существует",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid, "service_name": sname}
+                    ))
+                else:
+                    offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
+                    existing_ids.add(sid)
+                    added_count += 1
+                    modified = True
+            
+            # Сохраняем изменения
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+        
+        # Проверяем, какие услуги для экспайра не были найдены
+        found_expired = set()
+        for path in json_files:
+            data = _load_json(blob[path], path, [])
+            if data:
+                offerings = data.get("productOfferingsInGroup", [])
+                for o in offerings:
+                    sid = _normalize_id(o.get("id", ""))
+                    if sid in services_to_expire:
+                        found_expired.add(sid)
+        
+        not_found_expire = services_to_expire - found_expired
+        for sid in not_found_expire:
+            skipped_expire_not_found.append({
+                "service_id": sid,
+                "reason": "not_found_in_any_json"
+            })
+            result.add_issue(Issue(
+                type=IssueType.NOT_FOUND_SERVICE_ID,
+                severity="info",
+                message=f"Услуга для экспайра не найдена ни в одном JSON",
+                context={"service_id": sid}
+            ))
+        
+        # === ЭТАП 4: Формирование результата ===
+        result.counts["files_processed"] = len(updated)
+        result.counts["services_expired"] = expired_count
+        result.counts["services_added"] = added_count
+        result.counts["skipped_expire_not_found"] = len(skipped_expire_not_found)
+        result.counts["skipped_add_existing"] = len(skipped_add_existing)
+        
+        result.details = {
+            "skipped_expire_not_found": skipped_expire_not_found,
+            "skipped_add_existing": skipped_add_existing
+        }
+        
+        if not updated:
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
+        buf = _build_new_zip(names, blob, updated)
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
+    except Exception as e:
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
+
+
 def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id: str) -> SimpleResult:
     """1. Добавление перехода для одного тарифного плана."""
     result = SimpleResult(False, "", None, {})
@@ -1146,7 +1371,8 @@ if main_section == "Услуги (AddOns)":
         [
             "1. Доступность услуги для некоторых тарифных планов",
             "2. Добавление услуги в существующие планы",
-            "3. Экспайр услуги"
+            "3. Экспайр услуги",
+            "4. Экспайр + Добавление услуги"
         ]
     )
 
@@ -1198,7 +1424,7 @@ if main_section == "Услуги (AddOns)":
                     st.markdown("---")
                     _show_all_issues(res.issues)
 
-    else:
+    elif scenario.startswith("3."):
         st.subheader("Экспайр услуги")
         st.info("Excel/CSV должен содержать столбцы: json_id, service_id")
         zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
@@ -1216,6 +1442,84 @@ if main_section == "Услуги (AddOns)":
                     _show_counts(res.counts)
                     if res.zip_data:
                         st.download_button("Скачать ZIP", res.zip_data, "expired_addons.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
+
+    else:  # 4. Экспайр + Добавление услуги
+        st.subheader("Экспайр + Добавление услуги")
+        st.info("""
+        **Две независимые операции:**
+        1. Экспайр услуг из файла 1 (где они найдены)
+        2. Добавление услуг из файла 2 (во все JSON)
+        
+        Оба файла должны содержать столбцы: **ID услуги, Имя услуги**
+        """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("##### 📁 Файлы для экспайра")
+            zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"], key="expire_add_zip")
+            expire_file = st.file_uploader(
+                "Excel/CSV со списком услуг для экспайра",
+                type=["xlsx", "xls", "csv"],
+                key="expire_file"
+            )
+        
+        with col2:
+            st.markdown("##### 📁 Файлы для добавления")
+            st.write("")  # Выравнивание
+            st.write("")
+            add_file = st.file_uploader(
+                "Excel/CSV со списком услуг для добавления",
+                type=["xlsx", "xls", "csv"],
+                key="add_file"
+            )
+        
+        if st.button("Выполнить", type="primary"):
+            if not zip_file or not expire_file or not add_file:
+                st.error("Загрузите все три файла")
+            else:
+                with st.spinner("Обработка..."):
+                    res = expire_and_add_services(
+                        zip_file.read(),
+                        expire_file.read(),
+                        add_file.read()
+                    )
+                
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    
+                    # Детали пропусков
+                    if res.details:
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            expire_skipped = res.details.get("skipped_expire_not_found", [])
+                            with st.expander(f"❌ Не найдено для экспайра: {len(expire_skipped)}", expanded=False):
+                                if expire_skipped:
+                                    df = pd.DataFrame(expire_skipped)
+                                    st.dataframe(df, use_container_width=True)
+                        
+                        with col2:
+                            add_skipped = res.details.get("skipped_add_existing", [])
+                            with st.expander(f"⚠️ Уже существуют: {len(add_skipped)}", expanded=False):
+                                if add_skipped:
+                                    df = pd.DataFrame(add_skipped)
+                                    st.dataframe(df, use_container_width=True)
+                    
+                    if res.zip_data:
+                        st.download_button(
+                            "Скачать обновленный ZIP",
+                            res.zip_data,
+                            "expire_and_add_services.zip",
+                            "application/zip"
+                        )
                 
                 # Показываем все проблемы
                 if res.issues:
