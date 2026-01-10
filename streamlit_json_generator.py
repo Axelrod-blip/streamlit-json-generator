@@ -33,6 +33,7 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 class IssueType(Enum):
     ALREADY_EXISTS = "already_exists"
     ALREADY_EXPIRED = "already_expired"
+    ALREADY_ACTIVE = "already_active"  # <-- НОВЫЙ ТИП
     DUPLICATE_IN_SOURCE = "duplicate_in_source"
     NOT_FOUND_JSON_ID = "not_found_json_id"
     NOT_FOUND_SERVICE_ID = "not_found_service_id"
@@ -217,7 +218,7 @@ def _build_pog_addon(json_name: str, json_id: str, locale: str,
 
 
 def _build_pog_replace(json_name: str, json_id: str, locale: str,
-                       offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
+                        offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "description": [{"locale": locale, "value": json_name}],
         "effective": True,
@@ -629,8 +630,145 @@ def expire_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResul
     return result
 
 
+def activate_services_in_pogs(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
+    """4. Активация услуги (снятие флага expiredForSales)."""
+    result = SimpleResult(False, "", None, {})
+    
+    try:
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+        
+        result.counts["json_files_in_zip"] = len(json_files)
+        
+        df, read_issues = _read_table(excel_bytes, ["json_id", "service_id"])
+        result.issues.extend(read_issues)
+        
+        total_rows = len(df)
+        
+        for c in ["json_id", "service_id"]:
+            df[c] = df[c].apply(_normalize_str)
+        
+        for idx, row in df.iterrows():
+            if not row["json_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой json_id",
+                    row_number=idx + 2
+                ))
+            if not row["service_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой service_id",
+                    row_number=idx + 2
+                ))
+        
+        df = df[(df["json_id"] != "") & (df["service_id"] != "")]
+        
+        result.counts["total_rows"] = total_rows
+        result.counts["valid_rows"] = len(df)
+        
+        activate_map = df.groupby("json_id")["service_id"].apply(list).to_dict()
+        
+        updated: Dict[str, str] = {}
+        found_ids = set()
+        
+        for path in json_files:
+            data = _load_json(blob[path], path, result.issues)
+            if not data:
+                continue
+            
+            json_id = _normalize_id(data.get("id", ""))
+            if not json_id or json_id not in activate_map:
+                continue
+            
+            found_ids.add(json_id)
+            
+            if data.get("purpose") != ["addOn"]:
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается addOn)",
+                    file_path=path,
+                    context={"json_id": json_id}
+                ))
+                continue
+            
+            offerings = data.get("productOfferingsInGroup", [])
+            index_by_id = {_normalize_id(o.get("id", "")): o for o in offerings}
+            
+            modified = False
+            for sid in activate_map[json_id]:
+                sid = _normalize_id(sid)
+                o = index_by_id.get(sid)
+                if o is None:
+                    result.add_issue(Issue(
+                        type=IssueType.NOT_FOUND_SERVICE_ID,
+                        severity="error",
+                        message=f"Услуга не найдена",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid}
+                    ))
+                    continue
+                
+                # Если флаг True, меняем на False.
+                if o.get("expiredForSales", False) is True:
+                    o["expiredForSales"] = False
+                    modified = True
+                else:
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_ACTIVE,
+                        severity="info",
+                        message=f"Услуга уже активна",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid}
+                    ))
+            
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+        
+        for want_id in activate_map.keys():
+            if want_id not in found_ids:
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"json_id": want_id}
+                ))
+        
+        result.counts["files_processed"] = len(updated)
+        result.counts["activated"] = sum(1 for i in result.issues if i.type == IssueType.ALREADY_ACTIVE)
+        
+        if not updated:
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+        
+        buf = _build_new_zip(names, blob, updated)
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+        
+    except Exception as e:
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+    
+    return result
+
+
 def expire_and_add_services(zip_bytes: bytes, expire_excel: bytes, add_excel: bytes) -> SimpleResult:
-    """4. Экспайр + Добавление услуги (две независимые операции)."""
+    """5. Экспайр + Добавление услуги (две независимые операции)."""
     result = SimpleResult(False, "", None, {})
     
     try:
@@ -1371,8 +1509,9 @@ if main_section == "Услуги (AddOns)":
         [
             "1. Доступность услуги для некоторых тарифных планов",
             "2. Добавление услуги в существующие планы",
-            "3. Экспайр услуги",
-            "4. Экспайр + Добавление услуги"
+            "3. Экспайр услуги (скрыть из продажи)",
+            "4. Активация услуги (вернуть в продажу)",
+            "5. Экспайр + Добавление услуги (смешанный режим)"
         ]
     )
 
@@ -1427,8 +1566,8 @@ if main_section == "Услуги (AddOns)":
     elif scenario.startswith("3."):
         st.subheader("Экспайр услуги")
         st.info("Excel/CSV должен содержать столбцы: json_id, service_id")
-        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"])
-        excel_file = st.file_uploader("Загрузите Excel/CSV со списком к экспайру", type=["xlsx", "xls", "csv"])
+        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"], key="zip_expire")
+        excel_file = st.file_uploader("Загрузите Excel/CSV со списком к экспайру", type=["xlsx", "xls", "csv"], key="excel_expire")
         if st.button("Выполнить"):
             if not zip_file or not excel_file:
                 st.error("Загрузите ZIP и Excel/CSV")
@@ -1448,7 +1587,31 @@ if main_section == "Услуги (AddOns)":
                     st.markdown("---")
                     _show_all_issues(res.issues)
 
-    else:  # 4. Экспайр + Добавление услуги
+    elif scenario.startswith("4."):
+        st.subheader("Активация услуги")
+        st.info("Убирает флаг expiredForSales. Excel/CSV должен содержать столбцы: json_id, service_id")
+        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"], key="zip_activate")
+        excel_file = st.file_uploader("Загрузите Excel/CSV со списком для активации", type=["xlsx", "xls", "csv"], key="excel_activate")
+        if st.button("Выполнить"):
+            if not zip_file or not excel_file:
+                st.error("Загрузите ZIP и Excel/CSV")
+            else:
+                with st.spinner("Обработка..."):
+                    res = activate_services_in_pogs(zip_file.read(), excel_file.read())
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    if res.zip_data:
+                        st.download_button("Скачать ZIP", res.zip_data, "activated_addons.zip", "application/zip")
+                
+                # Показываем все проблемы
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
+
+    else:  # 5. Экспайр + Добавление услуги
         st.subheader("Экспайр + Добавление услуги")
         st.info("""
         **Две независимые операции:**
@@ -1471,7 +1634,7 @@ if main_section == "Услуги (AddOns)":
         
         with col2:
             st.markdown("##### 📁 Файлы для добавления")
-            st.write("")  # Выравнивание
+            st.write("") 
             st.write("")
             add_file = st.file_uploader(
                 "Excel/CSV со списком услуг для добавления",
