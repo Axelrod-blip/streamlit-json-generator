@@ -33,7 +33,7 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 class IssueType(Enum):
     ALREADY_EXISTS = "already_exists"
     ALREADY_EXPIRED = "already_expired"
-    ALREADY_ACTIVE = "already_active"  # <-- НОВЫЙ ТИП
+    ALREADY_ACTIVE = "already_active"
     DUPLICATE_IN_SOURCE = "duplicate_in_source"
     NOT_FOUND_JSON_ID = "not_found_json_id"
     NOT_FOUND_SERVICE_ID = "not_found_service_id"
@@ -218,7 +218,7 @@ def _build_pog_addon(json_name: str, json_id: str, locale: str,
 
 
 def _build_pog_replace(json_name: str, json_id: str, locale: str,
-                        offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
+                       offerings: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "description": [{"locale": locale, "value": json_name}],
         "effective": True,
@@ -1165,7 +1165,7 @@ def add_offer_to_transitions(zip_bytes: bytes, excel_bytes: bytes, offer_id: str
 
 
 def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleResult:
-    """3. Экспайр тарифного плана в переходах."""
+    """3. Экспайр тарифного плана в переходах (точечный)."""
     result = SimpleResult(False, "", None, {})
     
     try:
@@ -1297,6 +1297,107 @@ def expire_offer_in_transitions(zip_bytes: bytes, excel_bytes: bytes) -> SimpleR
         ))
         result.msg = f"Ошибка: {e}"
     
+    return result
+
+
+def expire_offers_globally(zip_bytes: bytes, offer_ids_list: List[str]) -> SimpleResult:
+    """
+    Массовый экспайр: ищет переданные offer_ids ВО ВСЕХ файлах архива
+    и ставит expiredForSales: True.
+    """
+    result = SimpleResult(False, "", None, {}, [])
+    
+    try:
+        # 1. Читаем ZIP
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+        
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+            
+        result.counts["json_files_in_zip"] = len(json_files)
+
+        # 2. Обрабатываем список ID из текстового поля
+        # Убираем дубликаты и пустые строки, нормализуем
+        targets_to_expire = set()
+        for raw_id in offer_ids_list:
+            clean_id = _normalize_id(raw_id)
+            if clean_id:
+                targets_to_expire.add(clean_id)
+        
+        if not targets_to_expire:
+            result.msg = "Список offer_id пуст"
+            return result
+
+        result.counts["unique_offers_to_expire"] = len(targets_to_expire)
+        
+        # 3. Проходим по ВСЕМ файлам
+        updated: Dict[str, str] = {}
+        files_touched = 0
+        offers_expired_count = 0
+        
+        # Детализация для отчета (какие файлы затронули)
+        touched_details_list = []
+
+        for path in json_files:
+            data = _load_json(blob[path], path, result.issues)
+            if not data:
+                continue
+            
+            offerings = data.get("productOfferingsInGroup", [])
+            if not offerings:
+                continue
+
+            modified = False
+            file_changed_count = 0
+            
+            for offering in offerings:
+                oid = _normalize_id(offering.get("id", ""))
+                
+                # Если ID есть в нашем списке
+                if oid in targets_to_expire:
+                    # Если еще не экспайрнут
+                    if not offering.get("expiredForSales", False):
+                        offering["expiredForSales"] = True
+                        modified = True
+                        file_changed_count += 1
+                        offers_expired_count += 1
+            
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+                files_touched += 1
+                
+                touched_details_list.append({
+                    "file": path,
+                    "expired_count": file_changed_count
+                })
+
+        # 4. Результат
+        result.counts["files_updated"] = files_touched
+        result.counts["total_offers_expired"] = offers_expired_count
+        result.details = {"updated_files": touched_details_list}
+        
+        if not updated:
+            result.ok = True
+            result.msg = "Совпадений не найдено, изменений нет."
+            return result
+            
+        buf = _build_new_zip(names, blob, updated)
+        result.ok = True
+        result.msg = f"Готово! Обновлено файлов: {files_touched}, экспайрнуто тарифов: {offers_expired_count}"
+        result.zip_data = buf
+
+    except Exception as e:
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+
     return result
 
 
@@ -1697,7 +1798,8 @@ elif main_section == "Переходы тарифных планов":
         [
             "1. Создать переход для одного тарифного плана",
             "2. Добавить тариф в переходы",
-            "3. Экспайр тарифа в переходах"
+            "3. Экспайр тарифа в переходах (точечно по json_id)",
+            "4. ГЛОБАЛЬНЫЙ экспайр (поиск тарифа во всех файлах)"
         ]
     )
 
@@ -1755,8 +1857,8 @@ elif main_section == "Переходы тарифных планов":
                     st.markdown("---")
                     _show_all_issues(res.issues)
 
-    else:
-        st.subheader("Экспайр тарифа в переходах")
+    elif scenario.startswith("3."):
+        st.subheader("Экспайр тарифа в переходах (точечный)")
         st.info("Excel/CSV должен содержать столбцы: json_id, offer_id")
         zip_file = st.file_uploader("Загрузите ZIP с переходами", type=["zip"])
         excel_file = st.file_uploader("Загрузите Excel/CSV", type=["xlsx", "xls", "csv"])
@@ -1778,6 +1880,71 @@ elif main_section == "Переходы тарифных планов":
                 if res.issues:
                     st.markdown("---")
                     _show_all_issues(res.issues)
+
+    elif scenario.startswith("4."):
+        st.subheader("Глобальный экспайр тарифов")
+        st.info("""
+        **Режим массового поиска:**
+        Скрипт откроет КАЖДЫЙ JSON файл в архиве. 
+        Если внутри найдется тариф из списка ниже — он получит `expiredForSales: true`.
+        """)
+        
+        # 1. Загрузка ZIP
+        zip_file = st.file_uploader("Загрузите ZIP (любые группы)", type=["zip"], key="zip_global_expire")
+        
+        # 2. Текстовое поле вместо файла
+        raw_text = st.text_area(
+            "Введите ID тарифов (offer_id)", 
+            height=200,
+            placeholder="Smart_Tariff_2023\nSuper_Vip_Old\nPromo_2020",
+            help="Можно вводить по одному в строке, либо через запятую/пробел."
+        )
+        
+        if st.button("Выполнить глобальный экспайр", type="primary"):
+            if not zip_file:
+                st.error("Сначала загрузите ZIP архив")
+            elif not raw_text.strip():
+                st.error("Введите хотя бы один offer_id")
+            else:
+                # Парсим текст в список: разбиваем по переносам строк, запятым и пробелам
+                offer_ids = [
+                    x.strip() 
+                    for x in re.split(r'[,\s\n]+', raw_text) 
+                    if x.strip()
+                ]
+                
+                if not offer_ids:
+                    st.error("Не удалось распознать ID в введенном тексте")
+                else:
+                    st.write(f"Распознано ID для поиска: **{len(offer_ids)}**")
+                    
+                    with st.spinner("Сканирование всех файлов архива..."):
+                        # Передаем список строк напрямую
+                        res = expire_offers_globally(zip_file.read(), offer_ids)
+                    
+                    if not res.ok:
+                        st.error(res.msg)
+                    else:
+                        st.success(res.msg)
+                        _show_counts(res.counts)
+                        
+                        # Показать детали
+                        if res.details and "updated_files" in res.details:
+                            with st.expander("Детали изменений по файлам"):
+                                df_details = pd.DataFrame(res.details["updated_files"])
+                                st.dataframe(df_details, use_container_width=True)
+
+                        if res.zip_data:
+                            st.download_button(
+                                "Скачать обновленный ZIP", 
+                                res.zip_data, 
+                                "global_expired_result.zip", 
+                                "application/zip"
+                            )
+                    
+                    if res.issues:
+                        st.markdown("---")
+                        _show_all_issues(res.issues)
 
 # --------- Раздел 3: Категории ----------
 else:
