@@ -980,6 +980,188 @@ def expire_and_add_services(zip_bytes: bytes, expire_excel: bytes, add_excel: by
     return result
 
 
+def add_addons_to_selected_pogs(zip_bytes: bytes, pog_excel: bytes, addons_excel: bytes) -> SimpleResult:
+    """6. Массовое добавление услуг в выбранные POG.
+
+    Входы:
+      - ZIP с существующими POG (purpose=addOn)
+      - Excel/CSV со списком json_id (какие POG модифицировать)
+      - Excel/CSV со списком услуг (ID услуги, Имя услуги)
+
+    Логика: каждая услуга из ADDONS добавляется в каждый указанный POG.
+    """
+    result = SimpleResult(False, "", None, {})
+
+    try:
+        names, blob, zip_issues = _read_zip(zip_bytes)
+        result.issues.extend(zip_issues)
+
+        json_files = _list_json_in_dir(blob, POG_DIR)
+        if not json_files:
+            result.msg = f"В ZIP нет JSON в {POG_DIR}/"
+            return result
+
+        result.counts["json_files_in_zip"] = len(json_files)
+
+        # === Читаем файл с ID POG ===
+        df_pog, pog_issues = _read_table(pog_excel, ["json_id"])
+        result.issues.extend(pog_issues)
+
+        df_pog["json_id"] = df_pog["json_id"].apply(_normalize_str)
+
+        for idx, row in df_pog.iterrows():
+            if not row["json_id"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой json_id",
+                    row_number=idx + 2
+                ))
+
+        target_ids = {x for x in df_pog["json_id"].tolist() if x}
+        result.counts["target_pogs"] = len(target_ids)
+
+        if not target_ids:
+            result.msg = "Нет валидных json_id в файле POG"
+            return result
+
+        # === Читаем файл с услугами ===
+        df_addons, addons_issues = _read_table(addons_excel, ["ID услуги", "Имя услуги"])
+        result.issues.extend(addons_issues)
+
+        for c in ["ID услуги", "Имя услуги"]:
+            df_addons[c] = df_addons[c].apply(_normalize_str)
+
+        for idx, row in df_addons.iterrows():
+            if not row["ID услуги"]:
+                result.add_issue(Issue(
+                    type=IssueType.EMPTY_ID,
+                    severity="warning",
+                    message="Пустой ID услуги",
+                    row_number=idx + 2
+                ))
+
+        df_addons = df_addons[df_addons["ID услуги"] != ""]
+
+        initial_count = len(df_addons)
+        df_addons = df_addons.drop_duplicates(subset=["ID услуги"])
+        dup_count = initial_count - len(df_addons)
+
+        if dup_count > 0:
+            result.add_issue(Issue(
+                type=IssueType.DUPLICATE_IN_SOURCE,
+                severity="info",
+                message=f"Удалено дубликатов услуг: {dup_count}"
+            ))
+
+        result.counts["addons_total"] = len(df_addons)
+
+        if df_addons.empty:
+            result.msg = "Нет валидных услуг в файле ADDONS"
+            return result
+
+        services_to_add = []
+        for _, row in df_addons.iterrows():
+            sid = _normalize_id(row["ID услуги"])
+            sname = _normalize_str(row["Имя услуги"])
+            if sid:
+                services_to_add.append({"id": sid, "name": sname})
+
+        # === Обработка JSON файлов ===
+        updated: Dict[str, str] = {}
+        found_ids = set()
+        added_count = 0
+        skipped_existing: List[Dict[str, str]] = []
+
+        for path in json_files:
+            data = _load_json(blob[path], path, result.issues)
+            if not data:
+                continue
+
+            json_id = _normalize_id(data.get("id", ""))
+            if not json_id or json_id not in target_ids:
+                continue
+
+            found_ids.add(json_id)
+
+            if data.get("purpose") != ["addOn"]:
+                result.add_issue(Issue(
+                    type=IssueType.INVALID_TARGET_TYPE,
+                    severity="error",
+                    message=f"Неверный purpose (ожидается addOn)",
+                    file_path=path,
+                    context={"json_id": json_id, "purpose": data.get("purpose")}
+                ))
+                continue
+
+            offerings = data.get("productOfferingsInGroup", [])
+            existing_ids = {_normalize_id(o.get("id", "")) for o in offerings}
+
+            modified = False
+            for service in services_to_add:
+                sid = service["id"]
+                sname = service["name"]
+
+                if sid in existing_ids:
+                    skipped_existing.append({
+                        "json_id": json_id,
+                        "service_id": sid,
+                        "service_name": sname,
+                        "reason": "already_exists"
+                    })
+                    result.add_issue(Issue(
+                        type=IssueType.ALREADY_EXISTS,
+                        severity="info",
+                        message=f"Услуга уже существует",
+                        file_path=path,
+                        context={"json_id": json_id, "service_id": sid, "service_name": sname}
+                    ))
+                else:
+                    offerings.append(_make_offering(sid, sname, DEFAULT_LOCALE))
+                    existing_ids.add(sid)
+                    added_count += 1
+                    modified = True
+
+            if modified:
+                data["productOfferingsInGroup"] = sorted(offerings, key=lambda x: x["id"])
+                updated[path] = _json_dumps_stable(data)
+
+        for want_id in target_ids:
+            if want_id not in found_ids:
+                result.add_issue(Issue(
+                    type=IssueType.NOT_FOUND_JSON_ID,
+                    severity="error",
+                    message=f"JSON файл не найден",
+                    context={"json_id": want_id}
+                ))
+
+        result.counts["pogs_found"] = len(found_ids)
+        result.counts["pogs_updated"] = len(updated)
+        result.counts["services_added"] = added_count
+        result.counts["skipped_existing"] = len(skipped_existing)
+        result.details = {"skipped_existing": skipped_existing}
+
+        if not updated:
+            result.ok = True
+            result.msg = "Нет изменений"
+            return result
+
+        buf = _build_new_zip(names, blob, updated)
+        result.ok = True
+        result.msg = "Готово"
+        result.zip_data = buf
+
+    except Exception as e:
+        result.add_issue(Issue(
+            type=IssueType.INVALID_JSON,
+            severity="error",
+            message=f"Критическая ошибка: {str(e)}"
+        ))
+        result.msg = f"Ошибка: {e}"
+
+    return result
+
+
 def create_replace_offer_from_excel(excel_bytes: bytes, json_name: str, json_id: str) -> SimpleResult:
     """1. Добавление перехода для одного тарифного плана."""
     result = SimpleResult(False, "", None, {})
@@ -1622,7 +1804,8 @@ if main_section == "Услуги (AddOns)":
             "2. Добавление услуги в существующие планы",
             "3. Экспайр услуги (скрыть из продажи)",
             "4. Активация услуги (вернуть в продажу)",
-            "5. Экспайр + Добавление услуги (смешанный режим)"
+            "5. Экспайр + Добавление услуги (смешанный режим)",
+            "6. Массовое добавление услуг в выбранные POG"
         ]
     )
 
@@ -1714,7 +1897,7 @@ if main_section == "Услуги (AddOns)":
                     st.markdown("---")
                     _show_all_issues(res.issues)
 
-    else:  # 5. Экспайр + Добавление услуги
+    elif scenario.startswith("5."):
         st.subheader("Экспайр + Добавление услуги")
         st.info("""
         **Две независимые операции:**
@@ -1783,6 +1966,63 @@ if main_section == "Услуги (AddOns)":
                             "Скачать обновленный ZIP",
                             res.zip_data,
                             "expire_and_add_services.zip",
+                            "application/zip"
+                        )
+
+                if res.issues:
+                    st.markdown("---")
+                    _show_all_issues(res.issues)
+
+    else:  # 6. Массовое добавление услуг в выбранные POG
+        st.subheader("Массовое добавление услуг в выбранные POG")
+        st.info("""
+        **Два отдельных файла:**
+        1. Файл POG — столбец: **json_id** (ID планов, в которые добавляем)
+        2. Файл ADDONS — столбцы: **ID услуги, Имя услуги** (какие услуги добавить)
+        
+        Каждая услуга из ADDONS будет добавлена в каждый указанный POG.
+        """)
+
+        zip_file = st.file_uploader("Загрузите ZIP с планами", type=["zip"], key="zip_mass_add")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("##### 📋 Список POG")
+            pog_file = st.file_uploader(
+                "Excel/CSV со списком json_id",
+                type=["xlsx", "xls", "csv"],
+                key="pog_ids_file"
+            )
+        with col2:
+            st.markdown("##### 📋 Список услуг")
+            addons_file = st.file_uploader(
+                "Excel/CSV со списком услуг (ID услуги, Имя услуги)",
+                type=["xlsx", "xls", "csv"],
+                key="addons_list_file"
+            )
+
+        if st.button("Выполнить", type="primary", key="btn_mass_add"):
+            if not zip_file or not pog_file or not addons_file:
+                st.error("Загрузите все три файла")
+            else:
+                with st.spinner("Обработка..."):
+                    res = add_addons_to_selected_pogs(
+                        zip_file.read(),
+                        pog_file.read(),
+                        addons_file.read()
+                    )
+
+                if not res.ok:
+                    st.error(res.msg)
+                else:
+                    st.success(res.msg)
+                    _show_counts(res.counts)
+                    _show_skipped_details(res.details, filename="skipped_mass_add.csv")
+                    if res.zip_data:
+                        st.download_button(
+                            "Скачать обновленный ZIP",
+                            res.zip_data,
+                            "mass_add_addons.zip",
                             "application/zip"
                         )
 
